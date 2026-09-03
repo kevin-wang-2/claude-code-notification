@@ -272,6 +272,15 @@ class StateTracker:
             if msg:
                 s.last_message = msg[:200]
             return
+        if name == "Notification":
+            # Claude Code 主动发系统通知 = 在等用户，绝不是工作信号。
+            # 只在 working 时翻红（漏掉权限事件的兜底）；idle 时的
+            # "waiting for input" 通知属正常闲置，不翻红。
+            if s.status == STATUS_WORKING:
+                s.status = STATUS_ATTENTION
+                s.attention_reason = "等待输入"
+                s.status_note = ""
+            return
         if name in ("MessageDisplay", "PermissionDenied"):
             # MessageDisplay：Claude 正在流式输出文本 = 确实在干活
             #   （解决：拒绝 tool use 后无事件，状态卡在"等待批准"）

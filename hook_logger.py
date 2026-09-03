@@ -85,6 +85,8 @@ if name == "StopFailure" and data.get("error"):
     record["error"] = data["error"]
 if name == "SessionStart" and data.get("source"):
     record["source"] = data["source"]
+if name == "Notification" and data.get("message"):
+    record["message"] = str(data["message"])[:200]
 if name == "Stop":
     msg = data.get("last_assistant_message", "")
     if msg:
