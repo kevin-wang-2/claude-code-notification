@@ -1,0 +1,5 @@
+#!/bin/bash
+# Claude 多 Session 状态提示器启动器
+# 授权辅助功能时请授权 "Claude Status" 而不是 python
+cd "$(dirname "$0")/../../.."
+exec ./venv/bin/python main.py

@@ -7,7 +7,7 @@
 - PostToolUse → working（刷新）
 - Stop → idle（附 last_assistant_message）
 - SessionEnd → 移除
-- 60s 无任何事件 → idle（兜底）
+- 15 分钟无任何事件 → idle（纯兜底，防 Stop 丢失；正常思考/长回复不误判）
 """
 import json
 import os
@@ -17,8 +17,10 @@ from pathlib import Path
 
 EVENTS_FILE = Path.home() / ".claude" / "status" / "events.jsonl"
 
-ATTENTION_GAP = 10.0   # PreToolUse 悬置超过此秒数 → needs_attention
-IDLE_TIMEOUT = 60.0    # 无事件超过此秒数 → idle
+ATTENTION_GAP = 10.0    # PreToolUse 悬置超过此秒数 → needs_attention
+ZOMBIE_TIMEOUT = 900.0  # 无任何事件超过此秒数 → idle（纯兜底，防 Stop 事件丢失；
+                        # 不能设太短——Claude 思考/长回复时可能长时间不调工具）
+RECENT_WINDOW = 300.0   # 只处理最近 N 秒内的事件（重读/启动回放时防死 session 复活）
 
 STATUS_WORKING = "working"
 STATUS_IDLE = "idle"
@@ -63,9 +65,15 @@ def _get(record, *keys, default=None):
     return default
 
 
+def _is_recent(e, now):
+    ts = _parse_ts(e.get("ts", ""), now)
+    return now - ts <= RECENT_WINDOW
+
+
 class SessionState:
     __slots__ = ("session_id", "project", "status", "last_message",
-                 "last_event_ts", "pending_ts", "attention_reason", "tool")
+                 "last_event_ts", "pending_ts", "attention_reason", "tool",
+                 "status_note")
 
     def __init__(self, session_id, project):
         self.session_id = session_id
@@ -76,6 +84,7 @@ class SessionState:
         self.pending_ts = None
         self.attention_reason = ""
         self.tool = ""
+        self.status_note = ""   # idle 变体说明："已中断" / "API 错误…"
 
 
 class StateTracker:
@@ -83,12 +92,17 @@ class StateTracker:
 
     def __init__(self):
         self.sessions = {}   # session_id -> SessionState
+        self._start_cwd = {}   # session_id -> 权威初始 cwd（来自 SessionStart）
         self._offset = 0
         self._file_size = 0
         self._load_existing()
 
     def _load_existing(self):
-        """启动时把已有事件全部吃一遍（重建当前状态，不从头显示历史 session）。"""
+        """启动时把已有事件全部吃一遍（重建当前状态，不从头显示历史 session）。
+
+        SessionStart 的 cwd 是权威项目路径，不受时间窗口限制（否则重启后
+        老 session 会回退到不可靠的 decode）；只有"活跃性"按最近事件过滤。
+        """
         if not EVENTS_FILE.exists():
             return
         try:
@@ -98,7 +112,21 @@ class StateTracker:
                 self._file_size = os.path.getsize(EVENTS_FILE)
         except Exception:
             return
-        # 只保留最近 ~2 分钟内的 session 相关事件，避免展示早已关闭的 session
+        # 第一遍：收集所有 SessionStart 的 cwd（无论多久以前）
+        start_cwd = {}
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if e.get("hook_event_name") == "SessionStart" and e.get("cwd"):
+                start_cwd[e.get("session_id")] = e["cwd"]
+        # 缓存权威 cwd：运行期间增量事件创建 session 时也要用（decode 对含 '-' 路径不可逆）
+        self._start_cwd = start_cwd
+        # 第二遍：回放最近窗口内的活跃事件
         now = time.time()
         for line in lines:
             line = line.strip()
@@ -108,13 +136,17 @@ class StateTracker:
                 e = json.loads(line)
             except Exception:
                 continue
-            ts = _parse_ts(e.get("ts", ""), now)
-            if now - ts > 300:      # >5 分钟前的 session 直接忽略
+            if not _is_recent(e, now):
                 continue
             self.apply_event(e)
-        # 清理：5 分钟前的旧 session 不显示
+        # 第三遍：用 SessionStart.cwd 修正 project（decode 只作无 SessionStart 时兑底）
+        for sid, s in self.sessions.items():
+            cwd = start_cwd.get(sid)
+            if cwd:
+                s.project = cwd.rstrip("/")
+        # 清理：窗口外的旧 session 不显示
         for sid in list(self.sessions.keys()):
-            if now - self.sessions[sid].last_event_ts > 300:
+            if now - self.sessions[sid].last_event_ts > RECENT_WINDOW:
                 del self.sessions[sid]
 
     def _read_new_events(self):
@@ -122,6 +154,10 @@ class StateTracker:
             return []
         try:
             size = os.path.getsize(EVENTS_FILE)
+            # 文件被轮转/截断/清理（变小）→ 从头重新读；
+            # 重读全文件必须套用时间窗口，否则会复活早已结束的死 session
+            if size < self._file_size or size < self._offset:
+                self._offset = 0
             if size == self._file_size:
                 return []
             with open(EVENTS_FILE) as f:
@@ -132,14 +168,18 @@ class StateTracker:
         except Exception:
             return []
         events = []
+        now = time.time()
         for line in lines:
             line = line.strip()
             if not line:
                 continue
             try:
-                events.append(json.loads(line))
+                e = json.loads(line)
             except Exception:
-                pass
+                continue
+            if not _is_recent(e, now):
+                continue
+            events.append(e)
         return events
 
     def apply_event(self, e):
@@ -154,6 +194,13 @@ class StateTracker:
             if s is None:
                 s = SessionState(sid, decode_project(e.get("transcript_path", "")))
                 self.sessions[sid] = s
+            # SessionStart 的 cwd = 初始工作目录 = 项目路径（权威）
+            # 注意：transcript_path 编码（/→-）对含 '-' 的路径不可逆（如 click-in），
+            # decode 只能作无 SessionStart 时的兑底
+            cwd = e.get("cwd")
+            if cwd:
+                s.project = cwd.rstrip("/")
+                self._start_cwd[sid] = s.project   # 增量 SessionStart 也更新缓存
             s.last_event_ts = ts
             return
         if name == "SessionEnd":
@@ -162,7 +209,11 @@ class StateTracker:
 
         s = self.sessions.get(sid)
         if s is None:
-            s = SessionState(sid, decode_project(e.get("transcript_path", "")))
+            cwd = self._start_cwd.get(sid)
+            if cwd:
+                s = SessionState(sid, cwd)   # 权威 cwd 优先，decode 只作兑底
+            else:
+                s = SessionState(sid, decode_project(e.get("transcript_path", "")))
             self.sessions[sid] = s
         s.last_event_ts = ts
 
@@ -170,10 +221,12 @@ class StateTracker:
             s.status = STATUS_ATTENTION
             s.attention_reason = "等待批准"
             s.tool = _get(e, "tool_name", default="")
+            s.status_note = ""
             return
         if name == "PreToolUse":
             s.status = STATUS_WORKING
             s.attention_reason = ""
+            s.status_note = ""
             s.tool = _get(e, "tool_name", default="")
             if s.tool == "AskUserQuestion":
                 s.status = STATUS_ATTENTION
@@ -185,23 +238,62 @@ class StateTracker:
         if name == "PostToolUse":
             s.status = STATUS_WORKING
             s.attention_reason = ""
+            s.status_note = ""
             s.pending_ts = None
+            return
+        if name == "PostToolUseFailure":
+            # 工具执行结束（无论成败），清除悬置，避免误判 needs_attention
+            s.pending_ts = None
+            if _get(e, "is_interrupt", default=False):
+                # 用户中断了工具执行 → 停止，标记"已中断"
+                s.status = STATUS_IDLE
+                s.attention_reason = ""
+                s.status_note = "已中断"
+            else:
+                # 工具报错，Claude 通常会换方法继续 → 保持工作中
+                s.status = STATUS_WORKING
+                s.attention_reason = ""
+                s.status_note = ""
+            return
+        if name == "StopFailure":
+            # 因 API 错误结束（rate_limit 等）→ 异常停止
+            s.status = STATUS_IDLE
+            s.pending_ts = None
+            s.attention_reason = ""
+            err = _get(e, "error", default="")
+            s.status_note = f"API 错误：{err}" if err else "API 错误"
             return
         if name == "Stop":
             s.status = STATUS_IDLE
             s.attention_reason = ""
+            s.status_note = ""
             s.pending_ts = None
             msg = _get(e, "last_assistant_message", default="")
             if msg:
                 s.last_message = msg[:200]
             return
+        if name in ("MessageDisplay", "PermissionDenied"):
+            # MessageDisplay：Claude 正在流式输出文本 = 确实在干活
+            #   （解决：拒绝 tool use 后无事件，状态卡在"等待批准"）
+            # PermissionDenied：权限被拒后 Claude 继续处理 → 恢复工作中
+            if s.status != STATUS_WORKING:
+                s.status = STATUS_WORKING
+                s.attention_reason = ""
+                s.status_note = ""
+            return
         # UserPromptSubmit 等其它事件：视为恢复活动
         if s.status == STATUS_IDLE or s.status == STATUS_ATTENTION:
             s.status = STATUS_WORKING
             s.attention_reason = ""
+            s.status_note = ""
 
     def tick(self, now=None):
-        """定时检查：长间隔 → attention；超时 → idle。"""
+        """定时检查：长间隔 → attention；僵尸超时 → idle。
+
+        idle 以 Stop 事件为准（一轮结束）；此处超时只是最后防线，
+        防止 Stop 事件丢失导致 session 永远挂着 working。
+        注意不要设太短：Claude 思考中/生成长回复时不产生工具事件。
+        """
         now = now or time.time()
         for s in self.sessions.values():
             if s.pending_ts is not None and now - s.pending_ts > ATTENTION_GAP:
@@ -209,7 +301,7 @@ class StateTracker:
                     s.status = STATUS_ATTENTION
                     s.attention_reason = "等待批准/回答"
             elif s.pending_ts is None and s.status == STATUS_WORKING \
-                    and now - s.last_event_ts > IDLE_TIMEOUT:
+                    and now - s.last_event_ts > ZOMBIE_TIMEOUT:
                 s.status = STATUS_IDLE
 
     def update(self):
