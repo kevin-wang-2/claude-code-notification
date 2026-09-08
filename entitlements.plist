@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- PyInstaller 把 Python.framework / Qt 等库内嵌进 bundle。主程序一旦用真证书
+	     （而非 ad-hoc）签名就会启用库验证，要求被加载的库与主程序签名主体一致，
+	     内嵌库满足不了，dlopen 直接失败：
+	     "mapping process and mapped file (non-platform) have different Team IDs"。
+	     关掉库验证即可 —— 本来就是本地自签名，没有 Team ID 可比。 -->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>

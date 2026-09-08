@@ -4,4 +4,7 @@ venv/
 .DS_Store
 build/
 dist/
+# Claude Status.spec 不忽略：装着签名身份 / bundle id / entitlements，
+# 是复现构建（以及辅助功能授权不失效）的必需配置
 *.spec
+!Claude Status.spec
