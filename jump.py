@@ -58,21 +58,32 @@ _ax_checked_at = 0.0
 
 
 def _has_ax_permission():
-    """探测辅助功能权限（5 分钟缓存）。VSCode 必然开着（session 在跑）。"""
+    """探测能否用 osascript 读 VSCode 窗口标题（5 分钟缓存）。
+
+    这条链路要**两个**互相独立的 TCC 权限，缺任一个都失败，报错不同：
+      -1743  本 app 没有「自动化」权限去控制 System Events
+      -25211 / "not allowed assistive access"  没有「辅助功能」权限
+    所以失败时必须把 stderr 记下来，否则分不清该去开哪个。
+    VSCode 必然开着（session 在跑），所以失败一定是权限而不是没窗口。
+    """
     global _ax_available, _ax_checked_at
     now = time.time()
     if _ax_available is not None and now - _ax_checked_at < 300:
         return _ax_available
     script = (f'tell application "System Events" to tell process "{VSCODE_PROCESS}" '
               f"to get name of every window")
+    err = ""
     try:
         r = subprocess.run(["osascript", "-e", script],
                            capture_output=True, text=True, timeout=10)
         _ax_available = (r.returncode == 0)
-    except Exception:
+        if not _ax_available:
+            err = f" rc={r.returncode} stderr={r.stderr.strip()[:300]!r}"
+    except Exception as e:
         _ax_available = False
+        err = f" exc={e!r}"
     _ax_checked_at = now
-    _jlog(f"ax probe -> {_ax_available}")
+    _jlog(f"ax probe -> {_ax_available}{err}")
     return _ax_available
 
 
