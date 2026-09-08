@@ -122,6 +122,10 @@ class Card(QFrame):
         self.status_label.setStyleSheet("color:#2196F3;font-size:11px;font-weight:bold;")
 
     # --- 点击跳转 / 按住拖动 ---
+    def enterEvent(self, e):
+        jump.prefetch()   # 预热窗口列表，点击时就不用等 code --status
+        super().enterEvent(e)
+
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
             self._press_pos = e.position().toPoint()

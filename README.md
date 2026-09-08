@@ -45,14 +45,18 @@ state.py 状态机 → main.py 浮窗
 ## 点击跳转（jump.py）
 
 点卡片 → 激活承载该 session 的 VSCode 窗口。先读 VSCode
-`globalStorage/storage.json` 的 `backupWorkspaces`（实时反映打开的窗口），把
-session cwd 解析到真正的窗口根——**普通文件夹窗口**或**复合工作区**（cwd 是
-工作区子文件夹时窗口标题不含它的名字）。候选逐个用 AXRaise 按标题验证
-（需辅助功能权限，backupWorkspaces 有已关窗口的残留条目，标题是唯一实时依据）。
+`globalStorage/storage.json` 的 `backupWorkspaces`，把 session cwd 解析到窗口根
+——**普通文件夹窗口**或**复合工作区**（cwd 是工作区子文件夹时窗口标题不含它的
+名字）。`backupWorkspaces` 只是**候选**：窗口关掉后条目长期残留（实测 2 个真实
+窗口 vs 16 条登记），不能用来判断窗口死活。有辅助功能权限时用 AXRaise 按标题
+逐个验证并置前（~0.2s，标题是唯一可靠的实时依据）。
 
-无 AX 权限的兜底原则：`code -r` 语义是「在最后活动窗口打开」，目标未打开时会
-**整个替换活动窗口的内容**——所以只对确认过的根使用；未命名工作区（无
-.code-workspace 文件可 -r）直接报错提示授权；确认没开的路径用 `code -n` 开新窗口。
+无 AX 权限时一律用**不带 flag 的 `code <目标>`**：已打开则聚焦那个窗口，未打开
+则开新窗口，任何情况下都不替换活动窗口。**绝不用 `code -r`**——它的语义是「在
+最后活动窗口打开」，目标没开着时会把活动窗口整个替换掉；曾经盲选残留条目再 -r，
+于是点开某些 chip 会把当前 workspace 覆盖掉。多个候选歧义时用 `code --status`
+的窗口列表挑活着的那个，但它**会漏报**（3 个窗口只列 2 个），只当正向信号；
+这一步 ~1-3s，在鼠标悬停卡片时就预热好（`jump.prefetch()`）。
 
 ## 架构说明：为什么是 hooks 而不是 Remote Control
 
