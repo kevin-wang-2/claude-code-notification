@@ -8,6 +8,11 @@
 - Stop → idle（附 last_assistant_message）
 - SessionEnd → 移除
 - 15 分钟无任何事件 → idle（纯兜底，防 Stop 丢失；正常思考/长回复不误判）
+- 30 分钟无任何事件 → 直接删除（兜底 SessionEnd 丢失，防永久假卡）
+
+只有 SessionStart、之后从未有过任何活动的 session 不出卡片（见 activated）：
+/clear 会连开 2~3 个 session id，其中的 bridge session 只承载 /clear 这条命令
+本身，十几秒后就结束，从不发 UserPromptSubmit / 工具事件。
 """
 import json
 import os
@@ -21,6 +26,9 @@ ATTENTION_GAP = 10.0    # PreToolUse 悬置超过此秒数 → needs_attention
 ZOMBIE_TIMEOUT = 900.0  # 无任何事件超过此秒数 → idle（纯兜底，防 Stop 事件丢失；
                         # 不能设太短——Claude 思考/长回复时可能长时间不调工具）
 RECENT_WINDOW = 300.0   # 只处理最近 N 秒内的事件（重读/启动回放时防死 session 复活）
+SESSION_TTL = 1800.0    # 无任何事件超过此秒数 → 移除 session。
+                        # 兜底：SessionEnd 若丢失（进程被 kill、hook 失败），
+                        # 卡片不会永久挂着。必须 > ZOMBIE_TIMEOUT。
 
 STATUS_WORKING = "working"
 STATUS_IDLE = "idle"
@@ -73,7 +81,7 @@ def _is_recent(e, now):
 class SessionState:
     __slots__ = ("session_id", "project", "status", "last_message",
                  "last_event_ts", "pending_ts", "attention_reason", "tool",
-                 "status_note")
+                 "status_note", "activated")
 
     def __init__(self, session_id, project):
         self.session_id = session_id
@@ -85,6 +93,7 @@ class SessionState:
         self.attention_reason = ""
         self.tool = ""
         self.status_note = ""   # idle 变体说明："已中断" / "API 错误…"
+        self.activated = False  # SessionStart 之后是否有过真实活动；False = 不出卡片
 
 
 class StateTracker:
@@ -216,6 +225,9 @@ class StateTracker:
                 s = SessionState(sid, decode_project(e.get("transcript_path", "")))
             self.sessions[sid] = s
         s.last_event_ts = ts
+        # 能走到这里的都是 SessionStart/SessionEnd 之外的事件 = 真实活动，
+        # bridge session 永远到不了这行
+        s.activated = True
 
         if name == "PermissionRequest":
             s.status = STATUS_ATTENTION
@@ -297,13 +309,19 @@ class StateTracker:
             s.status_note = ""
 
     def tick(self, now=None):
-        """定时检查：长间隔 → attention；僵尸超时 → idle。
+        """定时检查：长间隔 → attention；僵尸超时 → idle；彻底静默 → 移除。
 
         idle 以 Stop 事件为准（一轮结束）；此处超时只是最后防线，
         防止 Stop 事件丢失导致 session 永远挂着 working。
         注意不要设太短：Claude 思考中/生成长回复时不产生工具事件。
+
+        移除以 SessionEnd 为准；SESSION_TTL 只是兜底——SessionEnd 一旦丢失
+        （窗口被强杀、hook 写入失败），卡片否则会永久挂在浮窗上。
         """
         now = now or time.time()
+        for sid in [sid for sid, s in self.sessions.items()
+                    if now - s.last_event_ts > SESSION_TTL]:
+            del self.sessions[sid]
         for s in self.sessions.values():
             if s.pending_ts is not None and now - s.pending_ts > ATTENTION_GAP:
                 if s.status != STATUS_ATTENTION:
@@ -318,5 +336,17 @@ class StateTracker:
         for e in self._read_new_events():
             self.apply_event(e)
 
+    def visible_sessions(self):
+        """出卡片的 session：SessionStart 之后必须有过真实活动。
+
+        /clear 会连开 2~3 个 session id —— 旧 session 收尾、一个只承载 /clear
+        这条命令的 bridge session（transcript 里 type=bridge-session，十几秒后
+        SessionEnd）、以及真正的新 session。三者都发 SessionStart，若见之即建卡，
+        同一项目会瞬间冒出多张重复卡；bridge 的 SessionEnd 还常被攒着批量补发，
+        期间那张假卡一直挂着。bridge 从不发 UserPromptSubmit / 工具事件，
+        以"有过活动"为准即可滤掉。
+        """
+        return [s for s in self.sessions.values() if s.activated]
+
     def has_attention(self):
-        return any(s.status == STATUS_ATTENTION for s in self.sessions.values())
+        return any(s.status == STATUS_ATTENTION for s in self.visible_sessions())

@@ -200,12 +200,14 @@ class FloatingWindow(QWidget):
         self._rebuild()
 
     def _rebuild(self):
-        sessions = list(self.tracker.sessions.values())
+        # visible_sessions 而非 sessions：滤掉 /clear 产生的 bridge session
+        sessions = self.tracker.visible_sessions()
         order = {STATUS_ATTENTION: 0, STATUS_WORKING: 1, STATUS_IDLE: 2}
         sessions.sort(key=lambda s: (order.get(s.status, 3), s.project))
+        visible_ids = {s.session_id for s in sessions}
 
         for sid, card in list(self.cards.items()):
-            if sid not in self.tracker.sessions:
+            if sid not in visible_ids:
                 self.layout.removeWidget(card)
                 card.deleteLater()
                 del self.cards[sid]
