@@ -28,17 +28,24 @@ python3.13 -m venv venv        # 首次运行需要
 ## 数据流
 
 ```
-Claude Code hooks（~/.claude/settings.json 配置）
-        ↓ 追加
-~/.claude/status/events.jsonl
-        ↓ 500ms 轮询 ──┐
-state.py 状态机 ───────┼→ main.py 浮窗
-codex_state.py 状态机 ─┘
-        ↑ 500ms 轮询
-~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl（codex 每次 turn 的全量事件）
+Claude Code hooks（~/.claude/settings.json）        Codex hooks（~/.codex/hooks.json，需在 Codex 里信任）
+        ↓ 追加                                                 ↓ 追加
+~/.claude/status/events.jsonl                       ~/.codex/status/events.jsonl
+        ↓ 500ms 轮询 ──┐                            ↓ 500ms 轮询（事件驱动，**优先**）
+state.py 状态机 ──┼→ main.py 浮窗          codex_state.py 状态机 ──┤
+        ↑                                    ↑ 兜底：~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl
 ```
 
 两套状态机输出同一种 `SessionState`（`agent` 字段区分来源），主窗口合并排序渲染。
+
+**Codex 的两条路径**：配好并信任 `~/.codex/hooks.json` 后，事件是**实时写入**的（和 Claude 侧同款），能拿到两个直接信号——`PermissionRequest` = 等待批准、`SessionEnd` = 立即下卡；没信任 hooks 的会话（比如 CLI 直跑、旧会话）仍由 rollout 轮询兜底。两条共用同一份状态，顺序上 hooks 后应用（更权威）。
+
+## Codex hooks（可选，推荐）
+
+1. 事件落到 `~/.codex/status/events.jsonl`：由 `~/.codex/status/hook_logger.py` 完成（只落元数据，不落 `tool_input`/`tool_response`；额外记一个 `keys` = 原始 JSON 的**字段名**列表，方便确认 Codex 实际发了哪些字段）。
+2. 事件名与 Claude Code 同名：`SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PermissionRequest` / `PostToolUse` / `Stop` / `SessionEnd` / `Interrupt` / `PreCompact` / `PostCompact`（另支持 `SubagentStart/Stop`）。
+3. ⚠️ **Codex 的 hook 必须先“信任”才会执行**（否则静默跳过）。在 VS Code 的 Codex 设置 → **Hooks** 里逐项点 Trust（UI 文案：`settings.hooks.event.trust`）。没信任之前，浮窗靠 rollout 轮询照常工作。
+4. 验证：随便跑一轮 Codex，然后 `cat ~/.codex/status/events.jsonl` 应有新行；`ls -l` 看修改时间即可判活。
 
 ## 自检
 

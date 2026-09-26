@@ -242,9 +242,54 @@ def test_dismiss():
     shutil.rmtree(tmpd, ignore_errors=True)
 
 
+def test_codex_hooks():
+    """hook 事件路径：权限请求→等待批准、SessionEnd→下卡、子线程忽略。"""
+    print("Codex hooks 事件路径")
+    t = CodexTracker.__new__(CodexTracker)
+    t.sessions, t._tails, t._ignored = {}, {}, set()
+    t._thread_names, t._names_mtime = {}, None
+    t.dismissals = st.Dismissed(os.path.join(tempfile.mkdtemp(), "d.json"))
+    now = time.time()
+
+    def hk(name, sid="H1", ts=None, **kw):
+        r = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts or now)),
+             "agent": "codex", "hook_event_name": name, "session_id": sid,
+             "_ts": ts or now}
+        r.update(kw)
+        return r
+
+    t.apply_hook_record(hk("SessionStart", cwd="/p/demo"))
+    check("hook: SessionStart 不出卡", t.visible_sessions(), [])
+    t.apply_hook_record(hk("UserPromptSubmit"))
+    check("hook: UserPromptSubmit → working", t.sessions["H1"].status, st.STATUS_WORKING)
+    t.apply_hook_record(hk("PreToolUse", tool_name="exec"))
+    check("hook: PreToolUse 记 pending", t.sessions["H1"].pending_ts is not None, True)
+    t.apply_hook_record(hk("PermissionRequest", tool_name="apply_patch"))
+    check("hook: PermissionRequest → attention", t.sessions["H1"].status, st.STATUS_ATTENTION)
+    check("hook: 原因", t.sessions["H1"].attention_reason, "等待批准")
+    t.apply_hook_record(hk("PostToolUse"))
+    check("hook: PostToolUse → working", t.sessions["H1"].status, st.STATUS_WORKING)
+    t.apply_hook_record(hk("Stop", last_assistant_message="搞定了"))
+    check("hook: Stop → idle", t.sessions["H1"].status, st.STATUS_IDLE)
+    check("hook: Stop 带最后一句", t.sessions["H1"].last_message, "搞定了")
+    t.apply_hook_record(hk("SessionEnd"))
+    check("hook: SessionEnd → 下卡", "H1" in t.sessions, False)
+
+    # 内部子线程（guardian）的 hook 事件不建卡
+    t.apply_hook_record(hk("UserPromptSubmit", sid="G1", agent_type="guardian_review"))
+    check("hook: guardian 子线程不建卡", "G1" in t.sessions, False)
+    # 未知 agent_type 当用户线程（宁可多一张卡）
+    t.apply_hook_record(hk("UserPromptSubmit", sid="H2", agent_type="something_new"))
+    check("hook: 未知 agent_type 仍建卡", "H2" in t.sessions, True)
+    # 被忽略的子线程 id 后续事件也不建卡
+    t.apply_hook_record(hk("PreToolUse", sid="G1"))
+    check("hook: 已忽略 id 不复活", "G1" in t.sessions, False)
+
+
 if __name__ == "__main__":
     test_claude()
     test_codex()
     test_dismiss()
+    test_codex_hooks()
     print("FAILED" if FAILS else "ALL OK")
     sys.exit(1 if FAILS else 0)

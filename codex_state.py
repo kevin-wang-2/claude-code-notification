@@ -15,8 +15,14 @@
         custom_tool_call_output / function_call / function_call_output
 
 要点：
+- **两条数据路径**：① `~/.codex/status/events.jsonl`（hooks 事件，配好并信任
+  `~/.codex/hooks.json` 后由 hook 脚本实时写入）——事件驱动，**优先**；
+  ② `~/.codex/sessions/**/rollout-*.jsonl`（每条 turn 的全量事件）——兜底，
+  未信任 hooks 的会话、或早期历史会话靠它。两者共用同一份 sessions，顺序上
+  hooks 后应用（更权威）。
 - 目录与文件名用**本地时间**（rollout-2026-09-26T09-56-29-…），行内 timestamp 是
-  UTC（…Z）→ 一律用行内 timestamp 算时间，文件名只用来找文件。
+  UTC（…Z）→ 一律用行内 timestamp 算时间，文件名只用来找文件；hook 事件文件
+  则和 Claude 侧一致用本地时间。
 - 一条 rollout 里可能出现多个 session_meta（resume/rollover），事件按 payload.
   thread_id 归属；文件级兜底用"最后一次见到的 session_meta"。
 - session_meta 里 **id = 本线程 id，session_id 在子线程里是父线程 id**（实测
@@ -39,6 +45,9 @@
 | 静默 > 10 分钟 | 删卡 |
 | 右键“删除此会话” | 立即摘卡，但**下次再有事件会自动回来**（见 state.Dismissed） |
 
+hook 路径另有两条**直接信号**（比轮询准）：`PermissionRequest` → 🔴 等待批准；
+`SessionEnd` → 立即下卡（不用等 TTL 兜底）。
+
 死 session 清理：Codex **没有"会话结束"事件**（只有 turn 级的 task_complete /
 turn_aborted），所以只能靠超时。阈值比 Claude 侧紧（Claude 靠 SessionEnd 立即删卡，
 30 分钟只是兜底）：用户习惯"一个任务开一个会话、开完就关"，30 分钟会把已放弃的
@@ -57,6 +66,13 @@ from state import (ATTENTION_GAP, STATUS_ATTENTION, STATUS_IDLE,
 CODEX_DIR = Path.home() / ".codex"
 SESSIONS_DIR = CODEX_DIR / "sessions"        # sessions/<Y>/<M>/<D>/rollout-*.jsonl
 INDEX_FILE = CODEX_DIR / "session_index.jsonl"   # {"id":..,"thread_name":..,"updated_at":..}
+
+# Codex 也有一套 Claude Code 风格的 hooks（hooks.json，事件同名）。配好后事件会
+# 被 hook 脚本实时写到这里 —— 这是**事件驱动**的路径，优先于轮询 rollout。
+# 没信任/没配 hook 的会话仍然靠 rollout 兜底（两条都会跑，hooks 最后应用=更权威）。
+HOOK_EVENTS_FILE = CODEX_DIR / "status" / "events.jsonl"
+INTERNAL_AGENT_TYPES = {"subagent", "guardian", "review", "auto_review",
+                        "guardian_review", "guardian_v2"}
 
 # 死 session 清理阈值（Codex 无结束事件，只能超时清）——
 # 比 Claude 侧（ZOMBIE 15min / TTL 30min）紧，见模块 docstring。
@@ -80,6 +96,25 @@ def _parse_ts(ts_str, fallback):
             str(ts_str).replace("Z", "+00:00")).timestamp()
     except Exception:
         return fallback
+
+
+def _parse_local_ts(ts_str, fallback):
+    """hook 事件文件的 ts 是本地无时区 ISO 串（和 Claude 侧一致）。"""
+    try:
+        return datetime.datetime.fromisoformat(str(ts_str)).timestamp()
+    except Exception:
+        return fallback
+
+
+def _is_internal_hook(agent_type):
+    """hook 记录是不是内部子线程（guardian/审查）发的。
+
+    未知值一律当用户线程（宁多一张卡，也别把真会话滤没）。
+    """
+    if not agent_type:
+        return False
+    a = str(agent_type).strip().lower()
+    return a in INTERNAL_AGENT_TYPES or "subagent" in a or "guardian" in a
 
 
 def load_thread_names():
@@ -137,6 +172,8 @@ class CodexTracker:
         self.dismissals = dismissals or Dismissed()
         self._thread_names = load_thread_names()
         self._names_mtime = self._index_mtime()
+        self._hook_offset = 0       # hook 事件文件读取游标
+        self._hook_size = 0
         self._load_existing()
 
     # ---------- 文件发现 ----------
@@ -182,6 +219,9 @@ class CodexTracker:
                 continue
             tail = self._tails.setdefault(path, _Tail())
             self._consume(path, tail, now)
+        # hook 事件文件（若已配并信任 hooks）先读进来，再跑一次 rollout，两边共用
+        # 同一份 sessions；顺序上 hooks 后应用 = 更权威（见 update()）
+        self._apply_hook_records(self._read_hook_events(), now)
         for sid in [sid for sid, s in self.sessions.items()
                     if now - s.last_event_ts > CODEX_ACTIVE_WINDOW]:
             del self.sessions[sid]
@@ -201,6 +241,8 @@ class CodexTracker:
                     continue
                 tail = self._tails[path] = _Tail()
             self._consume(path, tail, now)
+        # 后应用 hook 事件：配了 hooks 的会话以它为准（rollout 只当兜底）
+        self._apply_hook_records(self._read_hook_events(), now)
 
     def _consume(self, path, tail, now):
         try:
@@ -369,6 +411,117 @@ class CodexTracker:
             s.status = STATUS_WORKING
             s.attention_reason = ""
             s.status_note = ""
+
+    # ---------- hook 事件（事件驱动路径） ----------
+    def _read_hook_events(self):
+        if not HOOK_EVENTS_FILE.exists():
+            return []
+        try:
+            size = os.path.getsize(HOOK_EVENTS_FILE)
+            if size < self._hook_size or size < self._hook_offset:
+                self._hook_offset = 0      # 被轮转/清理（hook_logger 会按 session 裁剪）
+            if size == self._hook_size:
+                return []
+            with open(HOOK_EVENTS_FILE, encoding="utf-8", errors="replace") as f:
+                f.seek(self._hook_offset)
+                lines = f.readlines()
+                self._hook_offset = f.tell()
+                self._hook_size = size
+        except Exception:
+            return []
+        now = time.time()
+        out = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            ts = _parse_local_ts(e.get("ts"), now)
+            if now - ts > CODEX_ACTIVE_WINDOW:
+                continue
+            e["_ts"] = ts
+            out.append(e)
+        return out
+
+    def _apply_hook_records(self, records, now):
+        for e in records:
+            self.apply_hook_record(e, now)
+
+    def apply_hook_record(self, e, now=None):
+        """hook 事件 → 状态。事件名/语义与 Claude 侧对齐（SessionStart/PreToolUse/
+        PermissionRequest/PostToolUse/Stop/SessionEnd/Interrupt）。
+
+        比轮询 rollout 多两个直接信号：**PermissionRequest = 等待批准**（不用再靠
+        10s 悬置猜）、**SessionEnd = 立即下卡**（不用等 10 分钟 TTL）。
+        """
+        name = e.get("hook_event_name")
+        sid = e.get("session_id")
+        now = now or time.time()
+        if not name or not sid:
+            return
+        ts = e.get("_ts") or now
+        if _is_internal_hook(e.get("agent_type")):
+            self._ignored.add(sid)
+            self.sessions.pop(sid, None)
+            return
+        if sid in self._ignored:
+            return
+
+        s = self._ensure(sid, e.get("cwd"), ts)
+        s.last_event_ts = ts
+
+        if name == "SessionStart":
+            # 与 Claude 侧同口径：SessionStart 之后有真实活动才出卡
+            s.activated = False
+            return
+        if name == "SessionEnd":
+            self.sessions.pop(sid, None)
+            return
+
+        s.activated = True
+        if name == "PermissionRequest":
+            s.status = STATUS_ATTENTION
+            s.attention_reason = "等待批准"
+            s.tool = e.get("tool_name") or s.tool
+            s.status_note = ""
+            s.pending_ts = None
+            return
+        if name == "Interrupt":
+            s.status = STATUS_IDLE
+            s.attention_reason = ""
+            s.status_note = "已中断"
+            s.pending_ts = None
+            return
+        if name == "Stop":
+            s.status = STATUS_IDLE
+            s.attention_reason = ""
+            s.status_note = ""
+            s.pending_ts = None
+            msg = e.get("last_assistant_message") or e.get("message") or ""
+            if msg:
+                s.last_message = str(msg)[:200]
+            return
+        if name == "PreToolUse":
+            s.status = STATUS_WORKING
+            s.attention_reason = ""
+            s.status_note = ""
+            s.tool = e.get("tool_name") or s.tool
+            s.pending_ts = ts
+            return
+        if name == "PostToolUse":
+            s.status = STATUS_WORKING
+            s.attention_reason = ""
+            s.status_note = ""
+            s.pending_ts = None
+            return
+        # UserPromptSubmit / PreCompact / PostCompact 及其它：视为活动
+        s.status = STATUS_WORKING
+        s.attention_reason = ""
+        s.status_note = ""
+        s.pending_ts = None
 
     # ---------- 对外 ----------
     def tick(self, now=None):
