@@ -109,7 +109,8 @@ def tick_sessions(sessions, now=None, attention_gap=ATTENTION_GAP,
                 if now - s.last_event_ts > session_ttl]:
         del sessions[sid]
     for s in sessions.values():
-        if s.pending_ts is not None and now - s.pending_ts > attention_gap:
+        gap = s.pending_gap or attention_gap     # 每会话可覆盖（见 SessionState.hook_seen）
+        if s.pending_ts is not None and now - s.pending_ts > gap:
             if s.status != STATUS_ATTENTION:
                 s.status = STATUS_ATTENTION
                 s.attention_reason = "等待批准/回答"
@@ -158,7 +159,8 @@ def _is_recent(e, now):
 class SessionState:
     __slots__ = ("session_id", "project", "status", "last_message",
                  "last_event_ts", "pending_ts", "attention_reason", "tool",
-                 "status_note", "activated", "agent", "title")
+                 "status_note", "activated", "agent", "title",
+                 "hook_seen", "pending_gap")
 
     def __init__(self, session_id, project):
         self.session_id = session_id
@@ -173,6 +175,8 @@ class SessionState:
         self.activated = False  # SessionStart 之后是否有过真实活动；False = 不出卡片
         self.agent = "claude"   # 事件来源："claude"（本文件）/ "codex"（codex_state.py）
         self.title = ""         # 可选显示名（Codex 的 thread_name；Claude 侧留空）
+        self.hook_seen = False  # 有 hook 事件覆盖（此时"等待批准"有直接信号）
+        self.pending_gap = None # 悬置兜底的阈值；None = 用调用方默认值
 
 
 class StateTracker:

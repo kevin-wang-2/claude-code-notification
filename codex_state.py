@@ -40,7 +40,7 @@
 | response_item: *_tool_call_output / item_completed(CommandExecution/FileChange) | working（清 pending） |
 | task_complete | idle（附 last_agent_message 前 200 字） |
 | turn_aborted | idle，status_note="已中断" |
-| 工具调用 pending > 10s | needs_attention（兜底） |
+| 工具调用 pending > 10s（无 hook 的会话）/ 90s（有 hook 的会话） | needs_attention（兜底） |
 | 工作中静默 > 3 分钟 | idle（关掉窗口后不再长时间装绿） |
 | 静默 > 10 分钟 | 删卡 |
 | 右键“删除此会话” | 立即摘卡，但**下次再有事件会自动回来**（见 state.Dismissed） |
@@ -79,6 +79,10 @@ INTERNAL_AGENT_TYPES = {"subagent", "guardian", "review", "auto_review",
 CODEX_ACTIVE_WINDOW = 600.0    # 启动回放/重读时，只认最近这么久内的活动（与删卡阈值同量级）
 CODEX_ZOMBIE_TIMEOUT = 180.0   # 工作中静默 → 空闲（3 分钟）
 CODEX_SESSION_TTL = 600.0      # 静默 → 删卡（10 分钟）
+# 有 hook 事件覆盖的会话："等待批准"有 PermissionRequest 这个**直接信号**，所以
+# 悬置兜底可以放松得多（否则 `clocksleep` / npm test 这类长工具会反复误报红）。
+# 没被 hook 覆盖的会话（CLI 直跑、未信任）仍用调用方的默认值（10s）。
+CODEX_HOOK_PENDING_GAP = 90.0
 
 # event_msg.payload.type 里表示"正在干活"的
 WORKING_EVENTS = {
@@ -472,6 +476,8 @@ class CodexTracker:
 
         s = self._ensure(sid, e.get("cwd"), ts)
         s.last_event_ts = ts
+        s.hook_seen = True
+        s.pending_gap = CODEX_HOOK_PENDING_GAP
 
         if name == "SessionStart":
             # 与 Claude 侧同口径：SessionStart 之后有真实活动才出卡
@@ -525,7 +531,10 @@ class CodexTracker:
 
     # ---------- 对外 ----------
     def tick(self, now=None):
-        """Codex 专用阈值（比 Claude 紧）：见文件顶部 CODEX_* 常量。"""
+        """Codex 专用阈值（比 Claude 紧）：见文件顶部 CODEX_* 常量。
+
+        hook 覆盖的会话的悬置阈值由 SessionState.pending_gap 单独给（90s）。
+        """
         tick_sessions(self.sessions, now,
                       zombie_timeout=CODEX_ZOMBIE_TIMEOUT,
                       session_ttl=CODEX_SESSION_TTL)

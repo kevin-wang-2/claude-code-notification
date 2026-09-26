@@ -20,8 +20,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import state as st                                    # noqa: E402
-from codex_state import (CODEX_SESSION_TTL, CODEX_ZOMBIE_TIMEOUT,
-                         CodexTracker)                      # noqa: E402
+from codex_state import (CODEX_HOOK_PENDING_GAP, CODEX_SESSION_TTL,
+                         CODEX_ZOMBIE_TIMEOUT, CodexTracker)      # noqa: E402
 
 FAILS = 0
 
@@ -264,6 +264,13 @@ def test_codex_hooks():
     check("hook: UserPromptSubmit → working", t.sessions["H1"].status, st.STATUS_WORKING)
     t.apply_hook_record(hk("PreToolUse", tool_name="exec"))
     check("hook: PreToolUse 记 pending", t.sessions["H1"].pending_ts is not None, True)
+    # hook 覆盖的会话：悬置兜底放松到 90s（否则 clocksleep / npm test 这类长工具误报红）
+    t.tick(now + 30)
+    check("hook: 悬置 30s 不翻红", t.sessions["H1"].status, st.STATUS_WORKING)
+    t.tick(now + CODEX_HOOK_PENDING_GAP + 5)
+    check("hook: 悬置 >90s 才翻红", t.sessions["H1"].status, st.STATUS_ATTENTION)
+    t.apply_hook_record(hk("PreToolUse", tool_name="exec"))   # 重置为工作中继续下一步
+    t.sessions["H1"].pending_ts = now
     t.apply_hook_record(hk("PermissionRequest", tool_name="apply_patch"))
     check("hook: PermissionRequest → attention", t.sessions["H1"].status, st.STATUS_ATTENTION)
     check("hook: 原因", t.sessions["H1"].attention_reason, "等待批准")
