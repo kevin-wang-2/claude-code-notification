@@ -179,8 +179,72 @@ def test_codex():
     check("TTL → 移除", "S1" in t.sessions, False)
 
 
+def test_dismiss():
+    """右键"删除会话"：立刻摘卡、落盘、再有活动自动回来。"""
+    print("右键删除（静音到下次活动）")
+    import shutil
+    from state import Dismissed, StateTracker
+
+    tmpd = tempfile.mkdtemp()
+    dpath = os.path.join(tmpd, "dismissed.json")
+    d = Dismissed(dpath)
+
+    # --- Claude 侧 ---
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+    now = time.time()
+    def ev(name, sid, ts=None, **kw):
+        r = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts or now)),
+             "hook_event_name": name, "session_id": sid}
+        r.update(kw)
+        return r
+
+    for r in [ev("SessionStart", "S1", cwd="/p/demo"),
+              ev("PreToolUse", "S1", tool_name="Bash"),
+              ev("PostToolUse", "S1"),
+              ev("Stop", "S1", last_assistant_message="done")]:
+        tmp.write(json.dumps(r) + "\n")
+    tmp.close()
+
+    orig = st.EVENTS_FILE
+    st.EVENTS_FILE = Path(tmp.name)
+    try:
+        t = StateTracker(d)
+        check("删除前有卡", len(t.visible_sessions()), 1)
+        check("dismiss 返回 True", t.dismiss("S1"), True)
+        check("删除后无卡", t.visible_sessions(), [])
+        check("落盘", os.path.exists(dpath), True)
+        check("重新加载仍被静音", Dismissed(dpath).is_dismissed("S1", now), True)
+
+        t.apply_event(ev("PreToolUse", "S1", ts=now + 5).copy())
+        check("有新事件 → 卡片自动回来", len(t.visible_sessions()), 1)
+        check("删除不存在的 session", t.dismiss("nope"), False)
+    finally:
+        st.EVENTS_FILE = orig
+        os.unlink(tmp.name)
+
+    # --- Codex 侧 ---
+    # 用 __new__ 造空 tracker：直接构造会去扫真实的 ~/.codex/sessions
+    t2 = CodexTracker.__new__(CodexTracker)
+    t2.sessions, t2._tails, t2._ignored = {}, {}, set()
+    t2._thread_names, t2._names_mtime = {}, None
+    t2.dismissals = d
+    tail = _Tail()
+    t2.apply_record(cdx("session_meta", {"id": "C1", "session_id": "C1", "cwd": "/p/proj",
+                                          "thread_source": "user", "source": "vscode"}), tail, now)
+    t2.apply_record(cdx("event_msg", {"type": "task_started", "thread_id": "C1"}), tail, now)
+    check("codex 删除前有卡", len(t2.visible_sessions()), 1)
+    check("codex dismiss", t2.dismiss("C1"), True)
+    check("codex 删除后无卡", t2.visible_sessions(), [])
+    t2.apply_record(cdx("event_msg", {"type": "task_started", "thread_id": "C1"},
+                        ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 5))), tail, now)
+    check("codex 有新事件 → 卡回来", len(t2.visible_sessions()), 1)
+
+    shutil.rmtree(tmpd, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_claude()
     test_codex()
+    test_dismiss()
     print("FAILED" if FAILS else "ALL OK")
     sys.exit(1 if FAILS else 0)

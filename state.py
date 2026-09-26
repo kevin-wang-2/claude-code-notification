@@ -22,6 +22,11 @@ from pathlib import Path
 
 EVENTS_FILE = Path.home() / ".claude" / "status" / "events.jsonl"
 
+# 手动“删除会话”（右键菜单）的记录。放这里是因为本应用的其它运行态（jump.log）
+# 也在同一目录。语义 = 静音到下次活动，见 Dismissed。
+DISMISSED_FILE = Path.home() / ".claude" / "status" / "dismissed.json"
+DISMISSED_TTL = 86400.0   # 记录最多留 24 小时（防文件无限长）
+
 ATTENTION_GAP = 10.0    # PreToolUse 悬置超过此秒数 → needs_attention
 ZOMBIE_TIMEOUT = 900.0  # 无任何事件超过此秒数 → idle（纯兜底，防 Stop 事件丢失；
                         # 不能设太短——Claude 思考/长回复时可能长时间不调工具）
@@ -39,6 +44,53 @@ STATUS_LABEL = {
     STATUS_IDLE: "空闲",
     STATUS_ATTENTION: "需关注",
 }
+
+
+class Dismissed:
+    """手动“删除会话”记录：{session_id: 阈值秒}，落盘到 dismissed.json。
+
+    语义 = **静音到下次活动**，不是黑名单：卡片立刻消失，但只要该 session 再来一条
+    事件（last_event_ts > 阈值）就会自动回到浮窗上。所以“删除”是可逆的——正在干活
+    的会话一秒内就会重新出现，不会被藏掉。
+    """
+
+    def __init__(self, path=None):
+        self.path = Path(path) if path else DISMISSED_FILE
+        self._data = {}
+        self._load()
+
+    def _load(self):
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                self._data = {str(k): float(v) for k, v in raw.items()}
+        except Exception:
+            self._data = {}
+        self._prune()
+
+    def _prune(self, now=None):
+        now = now or time.time()
+        for sid in [s for s, ts in self._data.items() if now - ts > DISMISSED_TTL]:
+            del self._data[sid]
+
+    def is_dismissed(self, sid, last_event_ts):
+        """还在被静音？阈值之前的事件都算“旧”，不出卡片。"""
+        ts = self._data.get(sid)
+        return ts is not None and last_event_ts <= ts
+
+    def add(self, sid, ts):
+        self._data[sid] = float(ts)
+        self._prune()
+        self.save()
+
+    def save(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            tmp.write_text(json.dumps(self._data, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self.path)
+        except Exception:
+            pass
 
 
 def tick_sessions(sessions, now=None, attention_gap=ATTENTION_GAP,
@@ -126,8 +178,9 @@ class SessionState:
 class StateTracker:
     """增量读取 events.jsonl 并驱动状态机。"""
 
-    def __init__(self):
+    def __init__(self, dismissals=None):
         self.sessions = {}   # session_id -> SessionState
+        self.dismissals = dismissals or Dismissed()
         self._start_cwd = {}   # session_id -> 权威初始 cwd（来自 SessionStart）
         self._offset = 0
         self._file_size = 0
@@ -363,8 +416,21 @@ class StateTracker:
         同一项目会瞬间冒出多张重复卡；bridge 的 SessionEnd 还常被攒着批量补发，
         期间那张假卡一直挂着。bridge 从不发 UserPromptSubmit / 工具事件，
         以"有过活动"为准即可滤掉。
+
+        再滤一层右键“删除”（静音到下次活动，见 Dismissed）。
         """
-        return [s for s in self.sessions.values() if s.activated]
+        return [s for s in self.sessions.values()
+                if s.activated
+                and not self.dismissals.is_dismissed(s.session_id, s.last_event_ts)]
+
+    def dismiss(self, sid):
+        """右键删除：记下阈值并立即摘掉卡片；该 session 再有事件会自动回来。"""
+        s = self.sessions.get(sid)
+        if s is None:
+            return False
+        self.dismissals.add(sid, max(s.last_event_ts, time.time()))
+        self.sessions.pop(sid, None)
+        return True
 
     def has_attention(self):
         return any(s.status == STATUS_ATTENTION for s in self.visible_sessions())

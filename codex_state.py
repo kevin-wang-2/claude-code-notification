@@ -37,6 +37,7 @@
 | 工具调用 pending > 10s | needs_attention（兜底） |
 | 工作中静默 > 3 分钟 | idle（关掉窗口后不再长时间装绿） |
 | 静默 > 10 分钟 | 删卡 |
+| 右键“删除此会话” | 立即摘卡，但**下次再有事件会自动回来**（见 state.Dismissed） |
 
 死 session 清理：Codex **没有"会话结束"事件**（只有 turn 级的 task_complete /
 turn_aborted），所以只能靠超时。阈值比 Claude 侧紧（Claude 靠 SessionEnd 立即删卡，
@@ -51,7 +52,7 @@ import time
 from pathlib import Path
 
 from state import (ATTENTION_GAP, STATUS_ATTENTION, STATUS_IDLE,
-                   STATUS_WORKING, SessionState, tick_sessions)
+                   STATUS_WORKING, Dismissed, SessionState, tick_sessions)
 
 CODEX_DIR = Path.home() / ".codex"
 SESSIONS_DIR = CODEX_DIR / "sessions"        # sessions/<Y>/<M>/<D>/rollout-*.jsonl
@@ -129,10 +130,11 @@ class _Tail:
 class CodexTracker:
     """增量读 rollout 文件并驱动与 Claude 侧同款的状态机。"""
 
-    def __init__(self):
+    def __init__(self, dismissals=None):
         self.sessions = {}          # session_id -> SessionState
         self._tails = {}            # path -> _Tail
         self._ignored = set()       # 内部子线程（guardian_review 等）的 thread_id，不出卡片
+        self.dismissals = dismissals or Dismissed()
         self._thread_names = load_thread_names()
         self._names_mtime = self._index_mtime()
         self._load_existing()
@@ -376,7 +378,19 @@ class CodexTracker:
                       session_ttl=CODEX_SESSION_TTL)
 
     def visible_sessions(self):
-        return [s for s in self.sessions.values() if s.activated]
+        """出卡片的 session；同样滤掉右键“删除”（静音到下次活动）。"""
+        return [s for s in self.sessions.values()
+                if s.activated
+                and not self.dismissals.is_dismissed(s.session_id, s.last_event_ts)]
+
+    def dismiss(self, sid):
+        """右键删除：记阈值 + 立即摘卡；同一线程再有事件自动重新出卡。"""
+        s = self.sessions.get(sid)
+        if s is None:
+            return False
+        self.dismissals.add(sid, max(s.last_event_ts, time.time()))
+        self.sessions.pop(sid, None)
+        return True
 
     def has_attention(self):
         return any(s.status == STATUS_ATTENTION for s in self.visible_sessions())

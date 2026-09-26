@@ -60,6 +60,15 @@ codex_state.py 状态机 ─┘
 | SessionEnd | 移除卡片 |
 | 15 分钟无事件 | ⚪ 空闲（纯兜底，防 Stop 丢失；思考/长回复不误判） |
 
+## 交互
+
+- **左键点卡片** → 跳转到承载该 session 的 VSCode 窗口（见下节）
+- **左键拖动** → 移动浮窗
+- **右键卡片** → 「删除此会话」：立即摘卡，但只是"静音到下次活动"——该 session 再来
+  一条事件（Claude 的工具事件 / Codex 的 `token_count` 等）就会自动回到浮窗上。
+  记录落在 `~/.claude/status/dismissed.json`（只存 session id + 阈值秒，24 小时自清）。
+- **右键空白处** → 退出
+
 ## 点击跳转（jump.py）
 
 点卡片 → 激活承载该 session 的 VSCode 窗口（两个来源共用：jump.py 只看 session 的 cwd）。

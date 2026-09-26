@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
 import jump
 from codex_state import CodexTracker
 from state import (STATUS_ATTENTION, STATUS_IDLE, STATUS_LABEL,
-                   STATUS_WORKING, StateTracker)
+                   STATUS_WORKING, Dismissed, StateTracker)
 
 COLORS = {
     STATUS_WORKING: "#4CAF50",
@@ -71,6 +71,7 @@ class Card(QFrame):
         super().__init__()
         self.setObjectName("card")
         self._press_pos = None
+        self.session_id = None
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
@@ -150,6 +151,25 @@ class Card(QFrame):
         jump.prefetch()   # 预热窗口列表，点击时就不用等 code --status
         super().enterEvent(e)
 
+    # --- 右键：删除此会话 ---
+    def contextMenuEvent(self, e):
+        """右键卡片 → 剔除这张卡（"静音到下次活动"，会话再有事件会自动回来）。
+
+        menu/action 挂到 window 而不是 self：菜单弹出期间 500ms 的 _rebuild
+        可能把这张卡 deleteLater 掉，挂 self 会连带析构掉正在显示的动作。
+        """
+        if not self.session_id:
+            return
+        win = self.window()
+        if win is None:
+            return
+        sid = self.session_id
+        menu = QMenu(win)
+        act = QAction("删除此会话（有活动自动回来）", win)
+        act.triggered.connect(lambda: win._dismiss(sid))
+        menu.addAction(act)
+        menu.exec(e.globalPos())
+
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
             self._press_pos = e.position().toPoint()
@@ -174,10 +194,12 @@ class Card(QFrame):
 
 
 class FloatingWindow(QWidget):
-    def __init__(self, tracker):
+    def __init__(self, tracker, dismissals=None):
         super().__init__()
         self.tracker = tracker
-        self.codex = CodexTracker()
+        # 两个 tracker 共用同一份"已删除"记录（右键菜单），否则各存一份
+        self.dismissals = dismissals or getattr(tracker, "dismissals", None) or Dismissed()
+        self.codex = CodexTracker(self.dismissals)
         self.cards = {}
 
         self.setWindowFlags(
@@ -251,6 +273,7 @@ class FloatingWindow(QWidget):
                 card.clicked.connect(lambda sid=s.session_id: self._jump(sid))
                 self.cards[s.session_id] = card
                 self.layout.addWidget(card)
+            card.session_id = s.session_id
             card.set_state(s)
 
         self.empty.setVisible(not sessions)
@@ -262,6 +285,13 @@ class FloatingWindow(QWidget):
             self.setWindowOpacity(1.0)
             return
         self.setWindowOpacity(0.9 if self._blink_on else 1.0)
+
+    def _dismiss(self, sid):
+        """右键"删除此会话"：记录阈值 + 立即摘卡；再有活动会自动回来。"""
+        _jlog(f"dismiss sid={sid}")
+        if not self.tracker.dismiss(sid):
+            self.codex.dismiss(sid)
+        self._rebuild()
 
     def _jump(self, sid):
         _jlog(f"_jump sid={sid}")
