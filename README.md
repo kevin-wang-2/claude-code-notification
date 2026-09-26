@@ -23,6 +23,8 @@ python3.13 -m venv venv        # 首次运行需要
 ./venv/bin/python main.py
 ```
 
+想打成 `.app` 装到 `/Applications` 长期用（含签名与 TCC 授权细节）：见 `BUILD.md`。
+
 ## 数据流
 
 ```
