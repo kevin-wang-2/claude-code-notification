@@ -41,6 +41,27 @@ STATUS_LABEL = {
 }
 
 
+def tick_sessions(sessions, now=None):
+    """两套 tracker（Claude hooks / Codex rollout）共用的兜底状态推进。
+
+    - pending 悬置超过 ATTENTION_GAP → needs_attention（漏了批准事件时的兜底）
+    - 无 pending 但 working 静默超过 ZOMBIE_TIMEOUT → idle（防完成事件丢失）
+    - 静默超过 SESSION_TTL → 移除（防会话结束时卡片永久挂着）
+    """
+    now = now or time.time()
+    for sid in [sid for sid, s in sessions.items()
+                if now - s.last_event_ts > SESSION_TTL]:
+        del sessions[sid]
+    for s in sessions.values():
+        if s.pending_ts is not None and now - s.pending_ts > ATTENTION_GAP:
+            if s.status != STATUS_ATTENTION:
+                s.status = STATUS_ATTENTION
+                s.attention_reason = "等待批准/回答"
+        elif s.pending_ts is None and s.status == STATUS_WORKING \
+                and now - s.last_event_ts > ZOMBIE_TIMEOUT:
+            s.status = STATUS_IDLE
+
+
 def decode_project(transcript_path):
     """~/.claude/projects/<编码路径>/<session-id>.jsonl → 初始项目路径。
 
@@ -81,7 +102,7 @@ def _is_recent(e, now):
 class SessionState:
     __slots__ = ("session_id", "project", "status", "last_message",
                  "last_event_ts", "pending_ts", "attention_reason", "tool",
-                 "status_note", "activated")
+                 "status_note", "activated", "agent", "title")
 
     def __init__(self, session_id, project):
         self.session_id = session_id
@@ -94,6 +115,8 @@ class SessionState:
         self.tool = ""
         self.status_note = ""   # idle 变体说明："已中断" / "API 错误…"
         self.activated = False  # SessionStart 之后是否有过真实活动；False = 不出卡片
+        self.agent = "claude"   # 事件来源："claude"（本文件）/ "codex"（codex_state.py）
+        self.title = ""         # 可选显示名（Codex 的 thread_name；Claude 侧留空）
 
 
 class StateTracker:
@@ -317,19 +340,10 @@ class StateTracker:
 
         移除以 SessionEnd 为准；SESSION_TTL 只是兜底——SessionEnd 一旦丢失
         （窗口被强杀、hook 写入失败），卡片否则会永久挂在浮窗上。
+
+        Codex 侧（codex_state.py）语义相同，共用下面的 tick_sessions。
         """
-        now = now or time.time()
-        for sid in [sid for sid, s in self.sessions.items()
-                    if now - s.last_event_ts > SESSION_TTL]:
-            del self.sessions[sid]
-        for s in self.sessions.values():
-            if s.pending_ts is not None and now - s.pending_ts > ATTENTION_GAP:
-                if s.status != STATUS_ATTENTION:
-                    s.status = STATUS_ATTENTION
-                    s.attention_reason = "等待批准/回答"
-            elif s.pending_ts is None and s.status == STATUS_WORKING \
-                    and now - s.last_event_ts > ZOMBIE_TIMEOUT:
-                s.status = STATUS_IDLE
+        tick_sessions(self.sessions, now)
 
     def update(self):
         """增量读取并应用事件。"""

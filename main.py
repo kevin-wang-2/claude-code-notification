@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
                              QMenu, QToolTip, QVBoxLayout, QWidget)
 
 import jump
+from codex_state import CodexTracker
 from state import (STATUS_ATTENTION, STATUS_IDLE, STATUS_LABEL,
                    STATUS_WORKING, StateTracker)
 
@@ -18,6 +19,11 @@ COLORS = {
     STATUS_WORKING: "#4CAF50",
     STATUS_IDLE: "#9E9E9E",
     STATUS_ATTENTION: "#F44336",
+}
+
+# 来源标记：Codex session 带一个青色小标签；Claude 保持原样（不显示）
+AGENT_TAGS = {
+    "codex": ("Codex", "#29B6F6"),
 }
 
 # idle 变体（status_note）颜色
@@ -74,11 +80,14 @@ class Card(QFrame):
         row.setSpacing(6)
         self.dot = QLabel("●")
         self.dot.setStyleSheet("font-size:14px;")
+        self.tag = QLabel("")
+        self.tag.setVisible(False)
         self.name = QLabel("")
         self.name.setStyleSheet("color:#EEE;font-weight:bold;font-size:13px;")
         self.status_label = QLabel("")
         self.status_label.setStyleSheet("font-size:11px;font-weight:bold;")
         row.addWidget(self.dot)
+        row.addWidget(self.tag)
         row.addWidget(self.name, 1)
         row.addWidget(self.status_label)
         layout.addLayout(row)
@@ -91,8 +100,23 @@ class Card(QFrame):
     def set_state(self, s):
         color = COLORS.get(s.status, "#999")
         self.dot.setStyleSheet(f"color:{color};font-size:14px;")
+        # 来源标签（Codex 才有；Claude 不显示，保持原外观）
+        tag = AGENT_TAGS.get(s.agent)
+        if tag:
+            text, tc = tag
+            self.tag.setText(text)
+            self.tag.setStyleSheet(
+                f"color:{tc};font-size:10px;font-weight:bold;"
+                f"border:1px solid {tc};border-radius:4px;padding:0px 3px;")
+            self.tag.setVisible(True)
+        else:
+            self.tag.setVisible(False)
         self.name.setText(s.project.split("/")[-1] if s.project and s.project != "?" else s.project)
-        self.name.setToolTip(s.project)
+        tip = s.project
+        if s.title:      # Codex thread_name（如「查看 Issue 701」）
+            self.name.setText(s.title[:24])
+            tip = f"{s.title}\n{s.project}"
+        self.name.setToolTip(tip)
         label = s.attention_reason if s.status == STATUS_ATTENTION else STATUS_LABEL.get(s.status, s.status)
         if s.status == STATUS_IDLE and s.status_note:
             # idle 变体：已中断 / API 错误（用对应颜色区分）
@@ -153,6 +177,7 @@ class FloatingWindow(QWidget):
     def __init__(self, tracker):
         super().__init__()
         self.tracker = tracker
+        self.codex = CodexTracker()
         self.cards = {}
 
         self.setWindowFlags(
@@ -168,7 +193,7 @@ class FloatingWindow(QWidget):
         self.layout.setContentsMargins(8, 8, 8, 8)
         self.layout.setSpacing(8)
 
-        self.empty = QLabel("暂无活跃 Claude session\n（等 hooks 事件…）")
+        self.empty = QLabel("暂无活跃 session\n（Claude Code / Codex，等事件…）")
         self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty.setStyleSheet("color:#666;font-size:12px;padding:20px;")
         self.layout.addWidget(self.empty)
@@ -201,11 +226,14 @@ class FloatingWindow(QWidget):
     def refresh(self):
         self.tracker.update()
         self.tracker.tick()
+        self.codex.update()
+        self.codex.tick()
         self._rebuild()
 
     def _rebuild(self):
         # visible_sessions 而非 sessions：滤掉 /clear 产生的 bridge session
-        sessions = self.tracker.visible_sessions()
+        # 两个来源（Claude hooks / Codex rollout）合并后统一排序渲染
+        sessions = self.tracker.visible_sessions() + self.codex.visible_sessions()
         order = {STATUS_ATTENTION: 0, STATUS_WORKING: 1, STATUS_IDLE: 2}
         sessions.sort(key=lambda s: (order.get(s.status, 3), s.project))
         visible_ids = {s.session_id for s in sessions}
@@ -230,7 +258,7 @@ class FloatingWindow(QWidget):
 
     def _blink(self):
         self._blink_on = not self._blink_on
-        if not self.tracker.has_attention():
+        if not (self.tracker.has_attention() or self.codex.has_attention()):
             self.setWindowOpacity(1.0)
             return
         self.setWindowOpacity(0.9 if self._blink_on else 1.0)
@@ -242,7 +270,7 @@ class FloatingWindow(QWidget):
             _jlog("debounced")
             return   # 去抖：防连点排队
         self._last_jump = now
-        s = self.tracker.sessions.get(sid)
+        s = self.tracker.sessions.get(sid) or self.codex.sessions.get(sid)
         if not s:
             _jlog("no session")
             return
