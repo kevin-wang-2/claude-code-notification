@@ -97,11 +97,19 @@ Codex 没有 hooks，但一条 turn 的每个事件都落在 rollout jsonl 里�
 | `event_msg.task_complete` | ⚪ 空闲（附 `last_agent_message` 前 200 字） |
 | `event_msg.turn_aborted` | ⚪ 空闲，标「已中断」 |
 | 工具调用 pending > 10s | 🔴 等待批准/回答（兜底，与 Claude 侧同款启发式） |
-| 30 分钟无事件 | 移除卡片（兜底窗口关闭/进程被杀） |
+| 工作中静默 > 3 分钟 | ⚪ 空闲（关掉窗口后不再长时间装绿） |
+| 静默 > 10 分钟 | 移除卡片（死 session 清理） |
 
 已知取舍：Codex 侧**没有**「等待批准」的显式事件（VS Code 里 approvals_reviewer=auto_review，
 批准过程是另开的 guardian_review 子线程），所以沿用 Claude 的 10s 悬置兜底 ——
 跑长命令（`npm test` 几十秒）时也会短暂翻红，属已知误报。
+
+**死 session 清理**：Codex 也没有任何「会话结束」事件（全部 rollout 里只有 turn 级的
+`task_complete`/`turn_aborted`），所以只能靠超时清死卡。阈值刻意比 Claude 侧紧
+（Claude 靠 `SessionEnd` 立即删卡，30 分钟只是兜底）：用户习惯「一个任务开一个会话、
+开完就关」，30 分钟会把已放弃的卡片挂太久。三个值在 `codex_state.py` 顶部：
+`CODEX_ACTIVE_WINDOW=600s`（启动只回放最近 10 分钟）/ `CODEX_ZOMBIE_TIMEOUT=180s` /
+`CODEX_SESSION_TTL=600s`。删卡后同一线程再有事件会自动重新出卡（读偏移不断）。
 
 自检：`./venv/bin/python codex_state.py` 打印当前 Codex session 状态。
 

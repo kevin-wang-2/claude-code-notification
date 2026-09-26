@@ -20,7 +20,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import state as st                                    # noqa: E402
-from codex_state import CodexTracker                  # noqa: E402
+from codex_state import (CODEX_SESSION_TTL, CODEX_ZOMBIE_TIMEOUT,
+                         CodexTracker)                      # noqa: E402
 
 FAILS = 0
 
@@ -80,6 +81,13 @@ def test_claude():
         s.pending_ts = time.time() - 11
         t.tick()
         check("悬置兜底 → attention", s.status, st.STATUS_ATTENTION)
+
+        # Claude 侧阈值仍是 zombie=900s / ttl=1800s：10 分钟不该删（Codex 侧才删）
+        s.pending_ts = None
+        s.status = st.STATUS_WORKING
+        s.last_event_ts = time.time()
+        t.tick(time.time() + CODEX_SESSION_TTL + 5)
+        check("Claude: 10min 静默仍保留（30min 才删）", "S1" in t.sessions, True)
 
         s.last_event_ts = time.time() - st.SESSION_TTL - 1
         t.tick()
@@ -144,6 +152,22 @@ def test_codex():
     t.apply_record(cdx("event_msg", {"type": "turn_aborted", "reason": "interrupted",
                                      "thread_id": "S1"}), tail, now)
     check("aborted: note", s.status_note, "已中断")
+
+    # Codex 专用阈值：工作中静默 3 分钟 → 空闲；静默 10 分钟 → 删卡
+    s.pending_ts = None
+    s.status = st.STATUS_WORKING
+    s.last_event_ts = now
+    t.tick(now + CODEX_ZOMBIE_TIMEOUT + 5)
+    check("codex: 3min 静默 → idle", s.status, st.STATUS_IDLE)
+    t.tick(now + CODEX_SESSION_TTL - 5)
+    check("codex: 未到 10min 不删卡", "S1" in t.sessions, True)
+    t.tick(now + CODEX_SESSION_TTL + 5)
+    check("codex: 10min 静默 → 删卡", "S1" in t.sessions, False)
+
+    # 删卡后同一线程再有事件 → 卡片自动回来（tail 偏移不断，不会重读旧事件）
+    t.apply_record(cdx("event_msg", {"type": "task_started", "thread_id": "S1"}), tail, now + 700)
+    check("codex: 重新活跃 → 卡片回来", "S1" in t.sessions, True)
+    s = t.sessions["S1"]
 
     t.apply_record(cdx("session_meta", {"id": "G1", "session_id": "S1", "cwd": "/p/proj",
                                         "thread_source": "guardian_review",

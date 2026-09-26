@@ -35,6 +35,13 @@
 | task_complete | idle（附 last_agent_message 前 200 字） |
 | turn_aborted | idle，status_note="已中断" |
 | 工具调用 pending > 10s | needs_attention（兜底） |
+| 工作中静默 > 3 分钟 | idle（关掉窗口后不再长时间装绿） |
+| 静默 > 10 分钟 | 删卡 |
+
+死 session 清理：Codex **没有"会话结束"事件**（只有 turn 级的 task_complete /
+turn_aborted），所以只能靠超时。阈值比 Claude 侧紧（Claude 靠 SessionEnd 立即删卡，
+30 分钟只是兜底）：用户习惯"一个任务开一个会话、开完就关"，30 分钟会把已放弃的
+卡片挂太久。三个值都在本文件顶部 CODEX_* 常量里。
 """
 import datetime
 import glob
@@ -43,12 +50,18 @@ import os
 import time
 from pathlib import Path
 
-from state import (RECENT_WINDOW, SESSION_TTL, STATUS_ATTENTION, STATUS_IDLE,
+from state import (ATTENTION_GAP, STATUS_ATTENTION, STATUS_IDLE,
                    STATUS_WORKING, SessionState, tick_sessions)
 
 CODEX_DIR = Path.home() / ".codex"
 SESSIONS_DIR = CODEX_DIR / "sessions"        # sessions/<Y>/<M>/<D>/rollout-*.jsonl
 INDEX_FILE = CODEX_DIR / "session_index.jsonl"   # {"id":..,"thread_name":..,"updated_at":..}
+
+# 死 session 清理阈值（Codex 无结束事件，只能超时清）——
+# 比 Claude 侧（ZOMBIE 15min / TTL 30min）紧，见模块 docstring。
+CODEX_ACTIVE_WINDOW = 600.0    # 启动回放/重读时，只认最近这么久内的活动（与删卡阈值同量级）
+CODEX_ZOMBIE_TIMEOUT = 180.0   # 工作中静默 → 空闲（3 分钟）
+CODEX_SESSION_TTL = 600.0      # 静默 → 删卡（10 分钟）
 
 # event_msg.payload.type 里表示"正在干活"的
 WORKING_EVENTS = {
@@ -155,19 +168,20 @@ class CodexTracker:
 
         只回放最近窗口内的事件（否则重启后老 session 会全体复活）；session_meta /
         turn_context 里的 cwd 不受窗口限制 —— 它们是"这个 session 属于哪个项目"
-        的权威来源。SESSION_TTL 之外的旧文件直接跳过（连兜底移除都过了，不可能出卡片）。
+        的权威来源。CODEX_SESSION_TTL 之外的旧文件直接跳过（连兜底移除都过了，
+        不可能出卡片）。
         """
         now = time.time()
         for path in self._candidate_files():
             try:
-                if now - os.path.getmtime(path) > SESSION_TTL:
+                if now - os.path.getmtime(path) > CODEX_SESSION_TTL:
                     continue
             except OSError:
                 continue
             tail = self._tails.setdefault(path, _Tail())
             self._consume(path, tail, now)
         for sid in [sid for sid, s in self.sessions.items()
-                    if now - s.last_event_ts > RECENT_WINDOW]:
+                    if now - s.last_event_ts > CODEX_ACTIVE_WINDOW]:
             del self.sessions[sid]
 
     # ---------- 增量读 ----------
@@ -181,7 +195,7 @@ class CodexTracker:
                 continue
             tail = self._tails.get(path)
             if tail is None:
-                if now - mtime > SESSION_TTL:
+                if now - mtime > CODEX_SESSION_TTL:
                     continue
                 tail = self._tails[path] = _Tail()
             self._consume(path, tail, now)
@@ -266,7 +280,7 @@ class CodexTracker:
         s = self._ensure(sid, cwd, ts)
 
         # 窗口外的事件：只用来补 cwd/标题，不参与状态（否则重启后死 session 复活）
-        if now - ts > RECENT_WINDOW:
+        if now - ts > CODEX_ACTIVE_WINDOW:
             return
 
         if typ == "event_msg":
@@ -356,7 +370,10 @@ class CodexTracker:
 
     # ---------- 对外 ----------
     def tick(self, now=None):
-        tick_sessions(self.sessions, now)
+        """Codex 专用阈值（比 Claude 紧）：见文件顶部 CODEX_* 常量。"""
+        tick_sessions(self.sessions, now,
+                      zombie_timeout=CODEX_ZOMBIE_TIMEOUT,
+                      session_ttl=CODEX_SESSION_TTL)
 
     def visible_sessions(self):
         return [s for s in self.sessions.values() if s.activated]

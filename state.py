@@ -41,24 +41,28 @@ STATUS_LABEL = {
 }
 
 
-def tick_sessions(sessions, now=None):
+def tick_sessions(sessions, now=None, attention_gap=ATTENTION_GAP,
+                  zombie_timeout=ZOMBIE_TIMEOUT, session_ttl=SESSION_TTL):
     """两套 tracker（Claude hooks / Codex rollout）共用的兜底状态推进。
 
-    - pending 悬置超过 ATTENTION_GAP → needs_attention（漏了批准事件时的兜底）
-    - 无 pending 但 working 静默超过 ZOMBIE_TIMEOUT → idle（防完成事件丢失）
-    - 静默超过 SESSION_TTL → 移除（防会话结束时卡片永久挂着）
+    三个阈值都可由调用方覆盖：Codex 侧没有"会话结束"事件，只能靠超时清死卡，
+    所以用的是一套更紧的值（见 codex_state.CODEX_*）。
+
+    - pending 悬置超过 attention_gap → needs_attention（漏了批准事件时的兜底）
+    - 无 pending 但 working 静默超过 zombie_timeout → idle（防空转/进程被杀）
+    - 静默超过 session_ttl → 移除（会话结束时卡片不永久挂着）
     """
     now = now or time.time()
     for sid in [sid for sid, s in sessions.items()
-                if now - s.last_event_ts > SESSION_TTL]:
+                if now - s.last_event_ts > session_ttl]:
         del sessions[sid]
     for s in sessions.values():
-        if s.pending_ts is not None and now - s.pending_ts > ATTENTION_GAP:
+        if s.pending_ts is not None and now - s.pending_ts > attention_gap:
             if s.status != STATUS_ATTENTION:
                 s.status = STATUS_ATTENTION
                 s.attention_reason = "等待批准/回答"
         elif s.pending_ts is None and s.status == STATUS_WORKING \
-                and now - s.last_event_ts > ZOMBIE_TIMEOUT:
+                and now - s.last_event_ts > zombie_timeout:
             s.status = STATUS_IDLE
 
 
