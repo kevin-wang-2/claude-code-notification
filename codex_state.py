@@ -73,6 +73,11 @@ INDEX_FILE = CODEX_DIR / "session_index.jsonl"   # {"id":..,"thread_name":..,"up
 HOOK_EVENTS_FILE = CODEX_DIR / "status" / "events.jsonl"
 INTERNAL_AGENT_TYPES = {"subagent", "guardian", "review", "auto_review",
                         "guardian_review", "guardian_v2"}
+# 内部工作会话（不出卡片）：
+#  - memory 会话：cwd=~/.codex/memories，由 memories_1.sqlite 的 jobs 驱动，
+#    **不写 rollout、不进 threads 表**，只在 hook 里露头（实测 2026-09-27）。
+#  - 其它 cwd 落在 CODEX_HOME 下的 worker 同理。
+INTERNAL_CWD_PREFIXES = (str(CODEX_DIR) + os.sep,)
 
 # 死 session 清理阈值（Codex 无结束事件，只能超时清）——
 # 比 Claude 侧（ZOMBIE 15min / TTL 30min）紧，见模块 docstring。
@@ -119,6 +124,14 @@ def _is_internal_hook(agent_type):
         return False
     a = str(agent_type).strip().lower()
     return a in INTERNAL_AGENT_TYPES or "subagent" in a or "guardian" in a
+
+
+def _is_internal_cwd(cwd):
+    """cwd 在 CODEX_HOME 下 = Codex 自己的内部工作目录（memory 等），不出卡。"""
+    if not cwd:
+        return False
+    c = str(cwd).rstrip("/")
+    return any(c == p.rstrip("/") or c.startswith(p) for p in INTERNAL_CWD_PREFIXES)
 
 
 def load_thread_names():
@@ -310,6 +323,10 @@ class CodexTracker:
                 self.sessions.pop(sid, None)
                 return
             cwd = p.get("cwd") or (p.get("runtime_workspace_roots") or [None])[0]
+            if _is_internal_cwd(cwd):
+                self._ignored.add(sid)      # 内部工作目录（~/.codex/**）
+                self.sessions.pop(sid, None)
+                return
             self._ensure(sid, cwd, ts)
             return
 
@@ -321,11 +338,19 @@ class CodexTracker:
         cwd = p.get("cwd")
         if not cwd and p.get("item"):
             cwd = _path_from_uri((p.get("item") or {}).get("cwd"))
+        if _is_internal_cwd(cwd):
+            self._ignored.add(sid)
+            self.sessions.pop(sid, None)
+            return
         if typ == "turn_context" and cwd:
             self._ensure(sid, cwd, ts)
             return
 
         s = self._ensure(sid, cwd, ts)
+        if _is_internal_cwd(s.project):     # 已建过卡的内部会话（cwd 后到）
+            self._ignored.add(sid)
+            self.sessions.pop(sid, None)
+            return
 
         # 窗口外的事件：只用来补 cwd/标题，不参与状态（否则重启后死 session 复活）
         if now - ts > CODEX_ACTIVE_WINDOW:
@@ -467,7 +492,7 @@ class CodexTracker:
         if not name or not sid:
             return
         ts = e.get("_ts") or now
-        if _is_internal_hook(e.get("agent_type")):
+        if _is_internal_hook(e.get("agent_type")) or _is_internal_cwd(e.get("cwd")):
             self._ignored.add(sid)
             self.sessions.pop(sid, None)
             return

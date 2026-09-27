@@ -169,6 +169,12 @@ def test_codex():
     check("codex: 重新活跃 → 卡片回来", "S1" in t.sessions, True)
     s = t.sessions["S1"]
 
+    # 内部工作目录（~/.codex/**，如 memory 会话）不出卡片
+    mem = os.path.expanduser("~/.codex/memories")
+    t.apply_record(cdx("session_meta", {"id": "M2", "session_id": "M2", "cwd": mem,
+                                        "thread_source": "user", "source": "vscode"}), tail, now)
+    check("rollout: ~/.codex/memories 不出卡", "M2" in t.sessions, False)
+
     t.apply_record(cdx("session_meta", {"id": "G1", "session_id": "S1", "cwd": "/p/proj",
                                         "thread_source": "guardian_review",
                                         "source": {"subagent": {"other": "guardian"}}}), tail, now)
@@ -285,6 +291,15 @@ def test_codex_hooks():
     # 内部子线程（guardian）的 hook 事件不建卡
     t.apply_hook_record(hk("UserPromptSubmit", sid="G1", agent_type="guardian_review"))
     check("hook: guardian 子线程不建卡", "G1" in t.sessions, False)
+    # 内部工作目录（~/.codex/**）—— memory 会话实测只会在 hook 里露头
+    mem = os.path.expanduser("~/.codex/memories")
+    t.apply_hook_record(hk("UserPromptSubmit", sid="M1", cwd=mem))
+    check("hook: ~/.codex/memories 不出卡", "M1" in t.sessions, False)
+    t.apply_hook_record(hk("PreToolUse", sid="M1", cwd=mem, tool_name="exec"))
+    check("hook: 内部会话后续事件也不出卡", "M1" in t.sessions, False)
+    t.apply_hook_record(hk("SessionEnd", sid="M1", cwd=mem))
+    check("hook: 内部会话 SessionEnd 也不报错", "M1" in t.sessions, False)
+
     # 未知 agent_type 当用户线程（宁可多一张卡）
     t.apply_hook_record(hk("UserPromptSubmit", sid="H2", agent_type="something_new"))
     check("hook: 未知 agent_type 仍建卡", "H2" in t.sessions, True)
