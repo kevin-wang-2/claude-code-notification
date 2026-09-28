@@ -9,6 +9,7 @@ cover：
   工具调用悬置兜底、工具出结果回落、agent_message、task_complete、turn_aborted、
   guardian_review 子线程不出卡片、SESSION_TTL 移除。
 """
+import datetime
 import json
 import os
 import sys
@@ -19,6 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import codex_state as cs                          # noqa: E402
 import state as st                                    # noqa: E402
 from codex_state import (CODEX_HOOK_PENDING_GAP, CODEX_SESSION_TTL,
                          CODEX_ZOMBIE_TIMEOUT, CodexTracker)      # noqa: E402
@@ -308,10 +310,44 @@ def test_codex_hooks():
     check("hook: 已忽略 id 不复活", "G1" in t.sessions, False)
 
 
+def test_old_dir_resume():
+    """回归：resume 老线程时 Codex 往旧日期目录的文件里追加 —— 必须仍能发现。
+
+    2026-09-27 的 bug：只扫"今天/昨天"两个日期目录，于是被 resume 的老线程
+    （文件在 sessions/<更早的日期>/ 里、内容却在追加）永远读不到，表现就是
+    "右键删除的卡片再也不回来"。
+    """
+    print("回归：旧日期目录里的活跃 rollout")
+    import shutil
+    tmp = tempfile.mkdtemp()
+    old = datetime.date.today() - datetime.timedelta(days=6)
+    d = Path(tmp) / f"{old:%Y}" / f"{old:%m}" / f"{old:%d}"
+    d.mkdir(parents=True)
+    f = d / "rollout-2026-01-01T00-00-00-00000000-0000-0000-0000-000000000000.jsonl"
+    now = time.time()
+    ts = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    with open(f, "w") as fh:
+        fh.write(json.dumps({"timestamp": ts, "type": "session_meta",
+                             "payload": {"id": "OLD1", "session_id": "OLD1", "cwd": "/p/old",
+                                         "thread_source": "user", "source": "vscode"}}) + "\n")
+        fh.write(json.dumps({"timestamp": ts, "type": "event_msg",
+                             "payload": {"type": "task_started", "thread_id": "OLD1"}}) + "\n")
+    orig = cs.SESSIONS_DIR
+    cs.SESSIONS_DIR = Path(tmp)
+    try:
+        t = CodexTracker()
+        check("6 天前目录里的活跃文件被发现", "OLD1" in t.sessions, True)
+        check("它的 cwd 正确", t.sessions["OLD1"].project, "/p/old")
+    finally:
+        cs.SESSIONS_DIR = orig
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_claude()
     test_codex()
     test_dismiss()
     test_codex_hooks()
+    test_old_dir_resume()
     print("FAILED" if FAILS else "ALL OK")
     sys.exit(1 if FAILS else 0)

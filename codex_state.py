@@ -89,6 +89,15 @@ CODEX_SESSION_TTL = 600.0      # 静默 → 删卡（10 分钟）
 # 没被 hook 覆盖的会话（CLI 直跑、未信任）仍用调用方的默认值（10s）。
 CODEX_HOOK_PENDING_GAP = 90.0
 
+# 发现候选 rollout 文件的范围：**不能只看"今天/昨天"的日期目录** ——
+# resume 一个老线程时 Codex 是往**原文件**追加的，文件会留在旧日期目录里
+# （实测：09-26 的文件 09-28 还在写）。所以扫最近 DISCOVERY_DAYS 天，
+# 再由调用方按 mtime 过滤；另外每 DB_ASSIST_INTERVAL 秒问一次 state_5.sqlite
+# （threads.updated_at_ms + rollout_path），兼顾"很久以前的线程又被继续"。
+DISCOVERY_DAYS = 14
+DB_ASSIST_INTERVAL = 30.0
+STATE_DB = CODEX_DIR / "state_5.sqlite"
+
 # event_msg.payload.type 里表示"正在干活"的
 WORKING_EVENTS = {
     "task_started", "user_message", "agent_message", "agent_reasoning",
@@ -191,6 +200,8 @@ class CodexTracker:
         self._names_mtime = self._index_mtime()
         self._hook_offset = 0       # hook 事件文件读取游标
         self._hook_size = 0
+        self._db_paths = set()      # DB 辅助发现到的 rollout 路径
+        self._db_checked_at = 0.0
         self._load_existing()
 
     # ---------- 文件发现 ----------
@@ -202,13 +213,40 @@ class CodexTracker:
             return None
 
     def _candidate_files(self):
-        """今/昨两天的 rollout 文件（目录按本地日期分；跨零点的 session 在昨天目录）。"""
+        """候选 rollout 文件（最近 DISCOVERY_DAYS 天的日期目录 + DB 辅助发现的）。
+
+        只扫今天/昨天会漏掉"被 resume 的老线程"：那时文件落在旧日期目录里、
+        内容却在持续追加（实测 2026-09-27 的 bug）。mtime 过滤由调用方做。
+        """
         out = []
         today = datetime.date.today()
-        for d in (today, today - datetime.timedelta(days=1)):
+        for d in (today - datetime.timedelta(days=i) for i in range(DISCOVERY_DAYS)):
             pat = SESSIONS_DIR / f"{d:%Y}" / f"{d:%m}" / f"{d:%d}" / "rollout-*.jsonl"
             out.extend(glob.glob(str(pat)))
+        out.extend(self._db_paths)
         return out
+
+    def _maybe_db_assist(self, now):
+        """每 30 秒问一次 state_5.sqlite：最近活跃的线程在哪个 rollout 文件。
+
+        纯尽善尽美：任何异常都不影响主流程（目录扫描仍能兜住近期会话）。
+        """
+        if now - self._db_checked_at < DB_ASSIST_INTERVAL:
+            return
+        self._db_checked_at = now
+        try:
+            import sqlite3
+            cut = int((now - max(CODEX_ACTIVE_WINDOW, 900.0)) * 1000)
+            con = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=1.0)
+            try:
+                rows = con.execute(
+                    "select rollout_path from threads where updated_at_ms > ?",
+                    (cut,)).fetchall()
+            finally:
+                con.close()
+            self._db_paths = {r[0] for r in rows if r[0] and os.path.exists(r[0])}
+        except Exception:
+            pass
 
     def _maybe_reload_names(self):
         m = self._index_mtime()
@@ -247,6 +285,7 @@ class CodexTracker:
     def update(self):
         now = time.time()
         self._maybe_reload_names()
+        self._maybe_db_assist(now)
         for path in self._candidate_files():
             try:
                 mtime = os.path.getmtime(path)
