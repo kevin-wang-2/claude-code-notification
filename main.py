@@ -2,6 +2,7 @@
 
 用法：python3 main.py
 """
+import os
 import sys
 import time
 
@@ -35,6 +36,22 @@ NOTE_COLORS = {
 JUMP_DEBOUNCE = 2.0   # 秒：去抖窗口，防连点排队
 
 JUMP_LOG = "/Users/kaibinwa/.claude/status/jump.log"   # 临时排查日志
+
+
+def _short_project(path):
+    """项目路径 → 卡片上要显示的工作区（~ 缩写；过长保留结尾，尾部才是仓库名）。"""
+    if not path or path == "?":
+        return path or ""
+    home = os.path.expanduser("~")
+    if path == home:
+        p = "~"
+    elif path.startswith(home + "/"):
+        p = "~" + path[len(home):]
+    else:
+        p = path
+    if len(p) > 40:
+        p = "…" + p[-39:]
+    return p
 
 
 def _jlog(msg):
@@ -93,6 +110,12 @@ class Card(QFrame):
         row.addWidget(self.status_label)
         layout.addLayout(row)
 
+        # 工作区（仅 Codex 有 thread_name 时显示：标题在前，工作区不让它藏起来）
+        self.place = QLabel("")
+        self.place.setStyleSheet("color:#888;font-size:10px;")
+        self.place.setVisible(False)
+        layout.addWidget(self.place)
+
         self.msg = QLabel("")
         self.msg.setWordWrap(True)
         self.msg.setStyleSheet("color:#999;font-size:11px;")
@@ -112,11 +135,17 @@ class Card(QFrame):
             self.tag.setVisible(True)
         else:
             self.tag.setVisible(False)
-        self.name.setText(s.project.split("/")[-1] if s.project and s.project != "?" else s.project)
-        tip = s.project
         if s.title:      # Codex thread_name（如「查看 Issue 701」）
+            # 标题优先，但另起一行小字显示工作区——否则「这张卡在哪个项目」
+            # 得悬停才看得到，容易认错工作区。
             self.name.setText(s.title[:24])
             tip = f"{s.title}\n{s.project}"
+            self.place.setText(_short_project(s.project))
+            self.place.setVisible(True)
+        else:
+            self.name.setText(s.project.split("/")[-1] if s.project and s.project != "?" else s.project)
+            tip = s.project
+            self.place.setVisible(False)
         self.name.setToolTip(tip)
         label = s.attention_reason if s.status == STATUS_ATTENTION else STATUS_LABEL.get(s.status, s.status)
         if s.status == STATUS_IDLE and s.status_note:
