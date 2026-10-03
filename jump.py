@@ -43,6 +43,15 @@ CODE_CLI = shutil.which("code") or "/opt/homebrew/bin/code"
 STORAGE_JSON = os.path.expanduser(
     "~/Library/Application Support/Code/User/globalStorage/storage.json")
 
+# CLI 会话（跑在 VS Code 集成终端里）跳转时，触发"聚焦终端"的快捷键。
+# 需与 ~/Library/Application Support/Code/User/keybindings.json 里那条绑定一致
+# （cmd+ctrl+shift+u -> workbench.action.terminal.focus），且该命令在
+# settings.json 的 terminal.integrated.commandsToSkipShell 里，终端有焦点时才会被 VS Code 接住。
+TERM_FOCUS_KEY = "u"
+TERM_FOCUS_MODS = "command down, control down, shift down"
+TERM_FOCUS_KEYCODE = 32                                # 'u' 的虚拟键码
+TERM_FOCUS_FLAGS = (1 << 20) | (1 << 18) | (1 << 17)   # cmd | ctrl | shift（CGEvent 标志位）
+
 JUMP_LOG = "/Users/kaibinwa/.claude/status/jump.log"   # 与 main.py 共用排查日志
 
 
@@ -257,22 +266,45 @@ def _is_live(w, titles):
 
 
 def _axraise(pattern):
-    """AXRaise 按窗口标题 contains 匹配置前。返回 (ok, error_msg_or_None)。"""
+    """把 VS Code 带到前台，并把标题 contains pattern 的窗口置前。返回 (ok, info)。
+
+    顺序很关键：**先 `set frontmost to true`（把 app 拉到前台），再 AXRaise 目标窗口**。
+    反过来做的话，VS Code 在 app 被激活时会把「上次活动的窗口」自己拉到前面，
+    把刚 raise 的窗口顶掉 —— 表现就是「Dock 图标出现了，但窗口没切」。
+    顺带：窗口若被最小化，先取消最小化（否则 raise 也白搭）。
+    """
     esc = pattern.replace("\\", "\\\\").replace('"', '\\"')
     script = f'''
 tell application "System Events"
     tell process "{VSCODE_PROCESS}"
-        set targetWindow to first window whose name contains "{esc}"
-        perform action "AXRaise" of targetWindow
+        set frontmost to true
+        try
+            set w to first window whose name contains "{esc}"
+        on error errMsg
+            return "nowindow"
+        end try
+        try
+            if (value of attribute "AXMinimized" of w) is true then
+                set value of attribute "AXMinimized" of w to false
+            end if
+        end try
+        try
+            perform action "AXRaise" of w
+        on error errMsg
+            return "raisefail:" & errMsg
+        end try
     end tell
 end tell
-tell application "{VSCODE_APP}" to activate
+return "ok"
 '''
     try:
         r = subprocess.run(["osascript", "-e", script],
                            capture_output=True, text=True, timeout=10)
+        out = r.stdout.strip()
         if r.returncode == 0:
-            return True, None
+            if out == "ok":
+                return True, None
+            return False, out
         return False, r.stderr.strip()[:200]
     except subprocess.TimeoutExpired:
         return False, "osascript 超时"
@@ -324,14 +356,166 @@ def _try_axraise(patterns):
     return False
 
 
+def _proc_cwd(pid):
+    """取进程 cwd（lsof）。失败返回 None。"""
+    try:
+        r = subprocess.run(["lsof", "-p", str(pid), "-a", "-d", "cwd"],
+                           capture_output=True, text=True, timeout=5)
+        lines = [l for l in r.stdout.splitlines() if l.strip()]
+        return lines[-1].split()[-1] if lines else None
+    except Exception:
+        return None
+
+
+def _proc_is_vscode_terminal(pid):
+    """进程是否跑在 VS Code 集成终端里（env 里有 TERM_PROGRAM=vscode）。"""
+    try:
+        r = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=5)
+        return "TERM_PROGRAM=vscode" in r.stdout
+    except Exception:
+        return False
+
+
+def _codex_cli_pids():
+    """正在跑的 codex CLI 进程 pid（排除 app-server / code-mode-host / daemon）。"""
+    try:
+        r = subprocess.run(["ps", "-axo", "pid=,command="],
+                           capture_output=True, text=True, timeout=5)
+    except Exception:
+        return []
+    pids = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line or "/codex" not in line:
+            continue
+        if any(k in line for k in ("app-server", "code-mode-host", "daemon")):
+            continue
+        pid = line.split(None, 1)[0]
+        if pid.isdigit():
+            pids.append(pid)
+    return pids
+
+
+def _has_vscode_terminal_session(project_path):
+    """项目下是否有 codex CLI 正跑在 VS Code 集成终端里。
+
+    只用来决定"聚焦窗口后要不要顺带聚焦终端面板"：
+    扩展侧会话（Codex 面板）不满足此条件，只有 CLI-in-VS-Code-terminal 才 True。
+    """
+    if not project_path or project_path == "?":
+        return False
+    proj = os.path.normpath(project_path.rstrip("/"))
+    for pid in _codex_cli_pids():
+        cwd = _proc_cwd(pid)
+        if not cwd:
+            continue
+        if os.path.normpath(cwd.rstrip("/")) != proj:
+            continue
+        if _proc_is_vscode_terminal(pid):
+            return True
+    return False
+
+
+def _frontmost_app_name():
+    """当前前台 app 名。"""
+    script = ('tell application "System Events" to get name of first application process '
+              'whose frontmost is true')
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=6)
+        return r.stdout.strip()
+    except Exception:
+        return "?"
+
+
+def _frontmost_is_vscode():
+    return _frontmost_app_name() == VSCODE_PROCESS
+
+
+def _post_focus_term_key():
+    """由本进程直接合成按键（CGEventPost），不经过 osascript。
+
+    为什么不用 System Events 的 keystroke：那条路会被 TCC 拦成
+    「osascript 不允许发送按键 (1002)」——发键被归因到 /usr/bin/osascript，
+    要额外给它「辅助功能」授权；而 Claude Status 本身已有「辅助功能」，
+    自己用 CGEventPost 发键就不需要任何新授权。
+    （AXRaise 能工作是因为那是 System Events 代做的 AX 动作，不触发这条限制。）
+    """
+    try:
+        import ctypes
+        import ctypes.util
+        cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics"))
+        cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
+        cg.CGEventCreateKeyboardEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool]
+        cg.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+        cg.CGEventSetFlags.restype = None
+        cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+        cg.CGEventPost.restype = None
+    except Exception as e:
+        _jlog(f"cg load failed: {e!r}")
+        return False
+    kCGHIDEventTap = 0
+    for down in (True, False):
+        ev = cg.CGEventCreateKeyboardEvent(None, TERM_FOCUS_KEYCODE, down)
+        if not ev:
+            return False
+        cg.CGEventSetFlags(ev, TERM_FOCUS_FLAGS)
+        cg.CGEventPost(kCGHIDEventTap, ev)
+    return True
+
+
+def _focus_vscode_terminal():
+    """把 VS Code 置前后，触发"聚焦终端"（幂等：隐藏则打开、已开则聚焦）。
+
+    安全护栏：只有确认 VS Code 在前台时才发键，避免快捷键外泄到别的应用。
+    """
+    if not _frontmost_is_vscode():
+        try:
+            subprocess.run(["osascript", "-e", f'tell application "{VSCODE_APP}" to activate'],
+                           capture_output=True, text=True, timeout=5)
+        except Exception:
+            pass
+        # 从别的 app 触发时激活有延迟，轮询等它真的到前台
+        deadline = time.time() + 2.5
+        while time.time() < deadline and not _frontmost_is_vscode():
+            time.sleep(0.2)
+    if not _frontmost_is_vscode():
+        _jlog("focus terminal -> VS Code 未到前台，放弃（避免按键外泄）")
+        return
+    if _post_focus_term_key():
+        _jlog("focus terminal -> cgevent sent")
+        return
+    # 兜底：System Events keystroke（需给 /usr/bin/osascript 辅助功能授权）
+    script = (
+        'tell application "System Events"\n'
+        f'    keystroke "{TERM_FOCUS_KEY}" using {{{TERM_FOCUS_MODS}}}\n'
+        '    return "sent"\n'
+        'end tell'
+    )
+    try:
+        r = subprocess.run(["osascript", "-e", script],
+                           capture_output=True, text=True, timeout=8)
+        _jlog(f"focus terminal -> osascript fallback {r.stdout.strip()!r} {r.stderr.strip()[:200]!r}")
+    except Exception as e:
+        _jlog(f"focus terminal exception {e!r}")
+
+
 def jump_to_project(project_path):
-    """按项目路径（session cwd）跳转到对应 VSCode 窗口。返回 (ok, message)。"""
+    """按项目路径（session cwd）跳转到对应 VSCode 窗口。返回 (ok, message)。
+
+    若该项目的 codex 是跑在 VS Code 集成终端里的 CLI 会话，则在聚焦窗口之后
+    再聚焦终端面板（否则只会停在窗口，到不了正在跑的 agent）。
+    """
     if not project_path or project_path == "?":
         return False, "无项目路径"
     folder = os.path.basename(project_path.rstrip("/"))
     if not folder:
         return False, "无文件夹名"
     _jlog(f"jump_to_project path={project_path!r} folder={folder!r}")
+    _jlog(f"frontmost before = {_frontmost_app_name()!r}")
+
+    # CLI-in-VS-Code-terminal 会话：跳转末尾要顺带聚焦终端面板
+    in_vscode_term = _has_vscode_terminal_session(project_path)
 
     # 0. 解析 cwd → 可能承载它的窗口根（文件夹窗口 / 复合工作区，可多个）
     roots = _open_roots()
@@ -339,11 +523,16 @@ def jump_to_project(project_path):
         # storage.json 读不到（格式变化等）→ AXRaise，再退到实时窗口验证
         _jlog("storage.json 不可用，退回 AXRaise / 直接 code")
         if _try_axraise([folder]):
+            if in_vscode_term:
+                _focus_vscode_terminal()
             return True, ""
-        return _focus_without_ax([], project_path)
+        ok, msg = _focus_without_ax([], project_path)
+        if ok and in_vscode_term:
+            _focus_vscode_terminal()
+        return ok, msg
 
     matches = _resolve_targets(project_path, roots)
-    _jlog(f"open_roots={len(roots)} matches={[(w['kind'], w.get('path') or w['name']) for w in matches]}")
+    _jlog(f"open_roots={len(roots)} matches={[(w['kind'], w.get('path') or w['name']) for w in matches]} vscode_term={in_vscode_term}")
 
     # 1. 有辅助权限：AXRaise 逐个候选验证（窗口标题是"真的开着"的唯一实时依据）
     if _has_ax_permission():
@@ -356,17 +545,26 @@ def jump_to_project(project_path):
                             w["name"] + "（工作区）",
                             w["name"] + " (工作区)"]
             if _try_axraise(patterns):
+                if in_vscode_term:
+                    _focus_vscode_terminal()
                 return True, ""
         if _try_axraise([folder]):   # storage.json 可能滞后，cwd 名字直接试一次
+            if in_vscode_term:
+                _focus_vscode_terminal()
             return True, ""
         # AX 确认没有窗口开着它 → code 开新窗口
         _jlog("AX 未命中任何窗口，code 开新窗口")
         ok, msg = _code_open(project_path.rstrip("/"))
+        if ok and in_vscode_term:
+            _focus_vscode_terminal()
         return (True, "") if ok else (False, msg)
 
     # 2. 无辅助权限：不判死活，直接用不带 flag 的 code —— 已打开则聚焦，
     #    未打开则开新窗口，绝不替换活动窗口。
-    return _focus_without_ax(matches, project_path)
+    ok, msg = _focus_without_ax(matches, project_path)
+    if ok and in_vscode_term:
+        _focus_vscode_terminal()
+    return ok, msg
 
 
 def _focus_without_ax(matches, project_path):
