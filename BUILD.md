@@ -33,6 +33,33 @@ cd ~/Desktop/claude-notification
 - 产物：`dist/Claude Status.app`。
 - 常见警告可忽略：`upx=True` 但本机没装 upx。
 
+### 已知坑：Apple 时间戳服务不可用（走代理时）
+
+PyInstaller 的**内部签名**硬编码了 `--timestamp`（`venv/.../PyInstaller/utils/osx.py` 的 `sign_binary()`），
+Apple 的 TSA 走代理常超时 → 构建**在签名这步直接失败**，`.app` 都出不来：
+
+```
+SystemError: codesign command (...) failed with error code 1!
+output: .../build/Claude Status/Claude Status: The timestamp service is not available.
+```
+
+自签名 + 本地自用**不需要**时间戳（DR 里本来也不含）。修法：删掉 venv 里那一行的 `--timestamp,`（留一份备份）：
+
+```bash
+cd ~/Desktop/claude-notification
+F=venv/lib/python3.13/site-packages/PyInstaller/utils/osx.py
+cp -n "$F" "$F.bak-claudestatus"
+python3 - "$F" <<'PY'
+import sys
+p=sys.argv[1]; s=open(p).read()
+old="'--all-architectures', '--timestamp', *extra_args, filename"
+new="'--all-architectures', *extra_args, filename"
+open(p,'w').write(s.replace(old,new))
+PY
+```
+
+改完重跑构建即可；DR 不变，辅助功能授权照样稳定。（`venv` 被重建/重装 PyInstaller 后需重做一次。）
+
 ## 2. 签名（构建日志里最后一步）
 
 PyInstaller 会自动执行（等价命令，出错时手动补跑）：
